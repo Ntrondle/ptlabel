@@ -1,0 +1,13 @@
+{
+  "blocks": [
+    {"Qr": {"data": "https://inventory.local/item/{n:04}", "ec": "M"}},
+    {"Text": {"text": "ASSET {n:04}\nLab bench · {date}", "bold": true, "align": "Left", "line_spacing": 1.0}},
+    {"Barcode": {"kind": "Code128", "data": "A{n:04}", "show_text": true, "module": 2}}
+  ],
+  "gap_mm": 2.5,
+  "frame": true,
+  "invert": false,
+  "fixed_length": false,
+  "length_mm": 60.0,
+  "align": "Center"
+}

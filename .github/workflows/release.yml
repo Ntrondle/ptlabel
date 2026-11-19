@@ -1,0 +1,46 @@
+name: Release build
+
+# Publishing a GitHub release builds PTLabel.dmg on macOS and attaches it.
+# Run manually (Actions → Release build → Run workflow) to get the DMG as an artifact.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
+
+      - name: Build app + DMG
+        run: scripts/bundle.sh --dmg
+
+      - name: Name the DMG
+        id: dmg
+        run: |
+          V="${GITHUB_REF_NAME}"
+          [[ "$GITHUB_EVENT_NAME" == "release" ]] || V="$(git rev-parse --short HEAD)"
+          F="PTLabel-${V}-macos-arm64.dmg"
+          cp target/PTLabel.dmg "$F"
+          echo "file=$F" >> "$GITHUB_OUTPUT"
+          ls -l "$F"
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.dmg.outputs.file }}" --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.dmg.outputs.file }}
+          path: ${{ steps.dmg.outputs.file }}
