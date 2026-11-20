@@ -43,6 +43,12 @@ pub fn run() -> anyhow::Result<()> {
             .with_inner_size([1240.0, 800.0])
             .with_min_inner_size([960.0, 600.0])
             .with_icon(window_icon()),
+        // Metal (wgpu) instead of OpenGL: no extra AppKit backing surfaces. Frame latency 1 =
+        // two drawables instead of three, ~15 MB less at Retina size (egui still uses 2 while resizing).
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            surface: eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY,
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(&name, options, Box::new(|cc| Ok(Box::new(App::new(cc)))))

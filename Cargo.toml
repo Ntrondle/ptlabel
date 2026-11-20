@@ -5,8 +5,11 @@ edition = "2024"
 description = "Fast label app for Brother PT-P710BT (Bluetooth) and PT-E550W (Wi-Fi)"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "persistence", "default_fonts", "clipboard", "system_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu_no_default_features", "persistence", "default_fonts", "clipboard", "system_fonts"] }
 egui = { version = "0.37", default-features = false }
+# Metal renderer only. eframe's "wgpu" feature would also pull in the Vulkan/GL/DX12/WebGPU backends;
+# glow (OpenGL) keeps ~45 MB more window buffers alive on macOS than a CAMetalLayer.
+egui-wgpu = { version = "0.37", default-features = false, features = ["macos-window-resize-jitter-fix"] }
 cosmic-text = "0.19"
 calamine = { version = "0.38", default-features = false }
 datamatrix = "0.3"
