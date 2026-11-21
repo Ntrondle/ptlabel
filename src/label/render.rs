@@ -20,6 +20,9 @@ pub const SS: usize = 2;
 pub const PREVIEW_SCALE: usize = 4;
 /// Ink threshold on the averaged 0..255 coverage.
 const THRESH: u32 = 110;
+/// Rasterised glyphs kept between renders. cosmic-text never evicts them and every
+/// font/size/subpixel position adds one (~50-200 KB at preview scale).
+const GLYPH_CACHE_MAX: usize = 32 << 20;
 
 /// Canvas pixels per mm at scale `s`.
 pub fn dpmm(s: usize) -> f32 {
@@ -27,8 +30,10 @@ pub fn dpmm(s: usize) -> f32 {
 }
 
 /// Round to a whole number of print dots (a multiple of `s` canvas pixels).
+/// Capped at 1000 mm, the longest label the printer takes (spec 2.3.4), so absurd
+/// sizes from a hand-edited file can't overflow or allocate gigabytes.
 fn snap(v: f32, s: usize) -> usize {
-    let v = v.round().max(0.0) as usize;
+    let v = v.round().clamp(0.0, 1000.0 * dpmm(s)) as usize;
     v.div_ceil(s) * s
 }
 
@@ -49,8 +54,19 @@ impl Canvas {
     }
 
     pub fn fill(&mut self, x: i64, y: i64, w: i64, h: i64, a: u8) {
-        let x0 = x.max(0) as usize;
-        let y0 = y.max(0) as usize;
+        // Fast paths for the per-pixel glyph callback: max(p, 0) is a no-op; 1x1 needs no clipping loop.
+        if a == 0 {
+            return;
+        }
+        if w == 1 && h == 1 {
+            if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
+                let p = &mut self.px[y as usize * self.w + x as usize];
+                *p = (*p).max(a);
+            }
+            return;
+        }
+        let x0 = (x.max(0) as usize).min(self.w);
+        let y0 = (y.max(0) as usize).min(self.h);
         let x1 = ((x + w).max(0) as usize).min(self.w);
         let y1 = ((y + h).max(0) as usize).min(self.h);
         for yy in y0..y1 {
@@ -62,18 +78,15 @@ impl Canvas {
     }
 
     pub fn blit(&mut self, src: &Canvas, x: usize, y: usize) {
-        for sy in 0..src.h {
-            let dy = y + sy;
-            if dy >= self.h {
-                break;
-            }
-            for sx in 0..src.w {
-                let dx = x + sx;
-                if dx >= self.w {
-                    break;
-                }
-                let d = &mut self.px[dy * self.w + dx];
-                *d = (*d).max(src.px[sy * src.w + sx]);
+        // Row slices clipped once (no per-pixel bounds checks).
+        let n = src.w.min(self.w.saturating_sub(x));
+        if n == 0 {
+            return;
+        }
+        for sy in 0..src.h.min(self.h.saturating_sub(y)) {
+            let d = &mut self.px[(y + sy) * self.w + x..][..n];
+            for (d, s) in d.iter_mut().zip(&src.px[sy * src.w..][..n]) {
+                *d = (*d).max(*s);
             }
         }
     }
@@ -97,6 +110,8 @@ pub struct Renderer {
     cache: SwashCache,
     metrics: HashMap<(String, bool, bool), (f32, f32)>,
     images: HashMap<String, Arc<image::GrayAlphaImage>>,
+    /// Per path: (source it was made from, target height, inverted, Lanczos-resized grey image).
+    resized: HashMap<String, (Arc<image::GrayAlphaImage>, u32, bool, Arc<image::GrayImage>)>,
 }
 
 impl Default for Renderer {
@@ -120,6 +135,7 @@ impl Renderer {
             cache: SwashCache::new(),
             metrics: HashMap::new(),
             images: HashMap::new(),
+            resized: HashMap::new(),
         }
     }
 
@@ -137,6 +153,11 @@ impl Renderer {
         v
     }
 
+    /// Bytes held by rasterised glyphs in the swash cache.
+    fn glyph_cache_bytes(&self) -> usize {
+        self.cache.image_cache.values().flatten().map(|i| i.data.len()).sum()
+    }
+
     /// Print bitmap.
     pub fn render(&mut self, label: &Label, tape: &Tape, vars: &Vars, opts: &PageOpts) -> Rendered {
         let r = self.render_canvas(label, tape, vars, opts, SS);
@@ -145,6 +166,9 @@ impl Renderer {
 
     /// Antialiased coverage canvas at `s` x 180 dpi (same layout as the print).
     pub fn render_canvas(&mut self, label: &Label, tape: &Tape, vars: &Vars, opts: &PageOpts, s: usize) -> RenderedCanvas {
+        if self.glyph_cache_bytes() > GLYPH_CACHE_MAX {
+            self.cache.image_cache.clear(); // re-rasterising is deterministic: output unchanged
+        }
         let pins = tape.print_pins as usize;
         let h = pins * s;
         let mut warnings = Vec::new();
@@ -264,7 +288,67 @@ impl Renderer {
             None => h as f32 / (em_box * (1.0 + (n - 1.0) * spacing)),
         };
         let style = LineStyle { underline: t.underline, align: t.align, spacing, italic: t.italic };
+        if t.rotation != super::Rotation::R0 {
+            return self.turned_lines(t, &lines, style, size, (asc, desc), h, s);
+        }
         self.draw_lines(&lines, &attrs(&t.font, t.bold, t.italic), style, size, (asc, desc), h, s)
+    }
+
+    /// Rotated text: drawn upright into its own buffer, then turned. Sideways (90°/270°)
+    /// the lines run across the tape, so auto-fit sizes the longest line to `h` and the
+    /// block's length along the tape follows the stacked lines.
+    #[allow(clippy::too_many_arguments)]
+    fn turned_lines(
+        &mut self,
+        t: &TextBlock,
+        lines: &[&str],
+        st: LineStyle,
+        size: f32,
+        (asc, desc): (f32, f32),
+        h: usize,
+        s: usize,
+    ) -> Canvas {
+        let a = attrs(&t.font, t.bold, t.italic);
+        let q = t.rotation.quarters();
+        if q % 2 == 0 {
+            return turn(&self.draw_lines(lines, &a, st, size, (asc, desc), h, s), q, h, s);
+        }
+        let mut size = size;
+        if t.size_pt.is_none() {
+            // draw_lines' buffer is max_w + italic overhang + s wide, rounded up to a dot.
+            let unit_w = self.max_line_w(lines, &a) + if t.italic { 0.15 } else { 0.0 };
+            if unit_w <= 0.0 {
+                return Canvas::new(0, h);
+            }
+            size = h.saturating_sub(2 * s) as f32 / unit_w;
+        }
+        let n = lines.len() as f32;
+        loop {
+            let stack = snap((asc + desc) * size * (1.0 + (n - 1.0) * st.spacing), s).max(s);
+            let c = self.draw_lines(lines, &a, st, size, (asc, desc), stack, s);
+            // Auto-fit never crops: shrink again should the drawn line come out longer than h.
+            if t.size_pt.is_some() || c.w <= h || size < 1.0 {
+                return turn(&c, q, h, s);
+            }
+            size *= h as f32 / c.w as f32 * 0.97;
+        }
+    }
+
+    /// Widest line at a 1 px font size (advances scale linearly with the size).
+    fn max_line_w(&mut self, lines: &[&str], a: &Attrs) -> f32 {
+        const REF: f32 = 100.0;
+        let mut max_w = 0f32;
+        for line in lines {
+            let mut buf = Buffer::new(&mut self.fs, Metrics::new(REF, REF));
+            buf.set_wrap(Wrap::None);
+            buf.set_size(None, None);
+            buf.set_text(line, a, Shaping::Advanced, None);
+            buf.shape_until_scroll(&mut self.fs, false);
+            if let Some(r) = buf.layout_runs().next() {
+                max_w = max_w.max(r.line_w);
+            }
+        }
+        max_w / REF
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -340,7 +424,7 @@ impl Renderer {
             Ec::H => qrcode::EcLevel::H,
         };
         let code = qrcode::QrCode::with_error_correction_level(data.as_bytes(), ec)
-            .map_err(|e| anyhow!("{e:?}"))?;
+            .map_err(|e| anyhow!("{e}"))?;
         let mw = code.width();
         let dots = (h / s) / mw;
         if dots == 0 {
@@ -349,11 +433,14 @@ impl Renderer {
         let m = dots * s;
         let size = mw * m;
         let y0 = ((h - size) / (2 * s)) * s;
-        let mut c = Canvas::new(size, h);
+        // 4-module quiet zone left and right (ISO/IEC 18004), like the barcode's; the
+        // unprinted tape edge gives it vertically.
+        let qz = 4 * m;
+        let mut c = Canvas::new(size + 2 * qz, h);
         for (i, col) in code.to_colors().iter().enumerate() {
             if *col == qrcode::Color::Dark {
                 let (mx, my) = (i % mw, i / mw);
-                c.fill((mx * m) as i64, (y0 + my * m) as i64, m as i64, m as i64, 255);
+                c.fill((qz + mx * m) as i64, (y0 + my * m) as i64, m as i64, m as i64, 255);
             }
         }
         Ok(c)
@@ -399,9 +486,10 @@ impl Renderer {
         let m = (dots / bm.height()) * s;
         let (w, hh) = (bm.width() * m, bm.height() * m);
         let y0 = ((h - hh) / (2 * s)) * s;
-        let mut c = Canvas::new(w, h);
+        // 1-module quiet zone left and right (ISO/IEC 16022).
+        let mut c = Canvas::new(w + 2 * m, h);
         for (x, y) in bm.pixels() {
-            c.fill((x * m) as i64, (y0 + y * m) as i64, m as i64, m as i64, 255);
+            c.fill((m + x * m) as i64, (y0 + y * m) as i64, m as i64, m as i64, 255);
         }
         Ok(c)
     }
@@ -412,8 +500,11 @@ impl Renderer {
             return Ok(Canvas::new(0, h));
         }
         let err = |e: barcoders::error::Error| anyhow!("{e}");
-        let bars: Vec<u8> = match b.kind {
+        let (bars, text): (Vec<u8>, String) = match b.kind {
             BarKind::Code128 => {
+                if let Some(c) = data.chars().find(|c| !c.is_ascii() && !matches!(c, 'À' | 'Ɓ' | 'Ć')) {
+                    bail!("Code 128 can't encode '{c}' (ASCII only)");
+                }
                 let d = if data.starts_with(['À', 'Ɓ', 'Ć']) {
                     data.to_string()
                 } else if data.len() >= 4 && data.len() % 2 == 0 && data.bytes().all(|c| c.is_ascii_digit()) {
@@ -421,11 +512,28 @@ impl Renderer {
                 } else {
                     format!("Ɓ{data}")
                 };
-                Code128::new(d).map_err(err)?.encode()
+                (Code128::new(d).map_err(err)?.encode(), data.trim_start_matches(['À', 'Ɓ', 'Ć']).to_string())
             }
-            BarKind::Code39 => Code39::new(data.to_uppercase()).map_err(err)?.encode(),
-            BarKind::Ean13 | BarKind::UpcA => EAN13::new(data).map_err(err)?.encode(),
-            BarKind::Ean8 => EAN8::new(data).map_err(err)?.encode(),
+            BarKind::Code39 => {
+                let d = data.to_uppercase();
+                if let Some(c) = d.chars().find(|c| !c.is_ascii_alphanumeric() && !" -.$/+%".contains(*c)) {
+                    bail!("Code 39 can't encode '{c}' (A–Z, 0–9, space and - . $ / + %)");
+                }
+                (Code39::new(&d).map_err(err)?.encode(), d)
+            }
+            BarKind::Ean13 => {
+                let d = gtin(data, 13, "EAN-13")?;
+                (EAN13::new(&d).map_err(err)?.encode(), d)
+            }
+            // UPC-A is the EAN-13 with a leading 0.
+            BarKind::UpcA => {
+                let d = gtin(data, 12, "UPC-A")?;
+                (EAN13::new(format!("0{d}")).map_err(err)?.encode(), d)
+            }
+            BarKind::Ean8 => {
+                let d = gtin(data, 8, "EAN-8")?;
+                (EAN8::new(&d).map_err(err)?.encode(), d)
+            }
         };
         let mw = b.module.clamp(1, 6) as usize * s;
         let quiet = 8 * mw;
@@ -439,7 +547,7 @@ impl Renderer {
             }
         }
         if b.show_text {
-            let cap = self.caption(data.trim_start_matches(['À', 'Ɓ', 'Ć']), text_h, s);
+            let cap = self.caption(&text, text_h, s);
             if cap.w > w {
                 // caption wider than the bars: widen canvas
                 let mut wide = Canvas::new(snap(cap.w as f32, s), h);
@@ -467,16 +575,27 @@ impl Renderer {
         // Threshold/dither at the 180-dpi print grid so preview and print match.
         let th = (h / s) as u32;
         let tw = ((img.width() as f32 / img.height().max(1) as f32) * th as f32).round().max(1.0) as u32;
-        let gray = image::GrayImage::from_fn(img.width(), img.height(), |x, y| {
-            let p = img.get_pixel(x, y);
-            let (l, a) = (p[0] as u32, p[1] as u32);
-            image::Luma([(255 - ((255 - l) * a) / 255) as u8])
-        });
-        let small = image::imageops::resize(&gray, tw, th, image::imageops::FilterType::Lanczos3);
+        // The resize dominates (tens of ms for a photo) and only depends on the source and `th`,
+        // which is the same for print and preview: reuse it across renders.
+        let small = match self.resized.get(&ib.path) {
+            Some((src, sth, inv, small)) if Arc::ptr_eq(src, &img) && *sth == th && *inv == ib.invert => small.clone(),
+            _ => {
+                let gray = image::GrayImage::from_fn(img.width(), img.height(), |x, y| {
+                    let p = img.get_pixel(x, y);
+                    let (l, a) = (p[0] as u32, p[1] as u32);
+                    // Invert before compositing on white so transparent areas never print.
+                    let l = if ib.invert { 255 - l } else { l };
+                    image::Luma([(255 - ((255 - l) * a) / 255) as u8])
+                });
+                let small = Arc::new(image::imageops::resize(&gray, tw, th, image::imageops::FilterType::Lanczos3));
+                self.resized.insert(ib.path.clone(), (img.clone(), th, ib.invert, small.clone()));
+                small
+            }
+        };
         let (w, hh) = (tw as usize, th as usize);
         let mut ink: Vec<f32> = small
             .pixels()
-            .map(|p| if ib.invert { p[0] as f32 } else { 255.0 - p[0] as f32 })
+            .map(|p| 255.0 - p[0] as f32)
             .collect();
         let mut bits = vec![false; w * hh];
         let t = 255.0 - ib.threshold as f32;
@@ -513,12 +632,53 @@ impl Renderer {
     }
 }
 
+/// EAN/UPC digits with the check digit appended (`n - 1` digits) or verified (`n`).
+fn gtin(data: &str, n: usize, name: &str) -> Result<String> {
+    if !data.bytes().all(|c| c.is_ascii_digit()) || !(n - 1..=n).contains(&data.len()) {
+        bail!("{name} needs {} digits, or {n} with the check digit", n - 1);
+    }
+    // GS1 mod 10: weights 3, 1, 3, ... from the rightmost data digit.
+    let sum: u32 = data.bytes().take(n - 1).rev().enumerate().map(|(i, c)| (c - b'0') as u32 * if i % 2 == 0 { 3 } else { 1 }).sum();
+    let check = char::from(b'0' + ((10 - sum % 10) % 10) as u8);
+    match data.chars().nth(n - 1) {
+        Some(c) if c != check => bail!("{name} check digit is {check}, not {c}"),
+        Some(_) => Ok(data.to_string()),
+        None => Ok(format!("{data}{check}")),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LineStyle {
     underline: bool,
     align: Align,
     spacing: f32,
     italic: bool,
+}
+
+/// `c` turned clockwise by `q` quarter turns and centred across a canvas `h` high
+/// (cropped evenly if longer). Quarter turns are lossless, so antialiasing is kept.
+fn turn(c: &Canvas, q: u8, h: usize, s: usize) -> Canvas {
+    if c.w == 0 || c.h == 0 {
+        return Canvas::new(0, h);
+    }
+    let (w2, h2) = if q % 2 == 1 { (c.h, c.w) } else { (c.w, c.h) };
+    let top = (h as i64 - h2 as i64) / (2 * s as i64) * s as i64;
+    let mut out = Canvas::new(w2, h);
+    for y in 0..c.h {
+        for x in 0..c.w {
+            let (dx, dy) = match q % 4 {
+                1 => (c.h - 1 - y, x),
+                2 => (c.w - 1 - x, c.h - 1 - y),
+                3 => (y, c.w - 1 - x),
+                _ => (x, y),
+            };
+            let dy = dy as i64 + top;
+            if dy >= 0 && (dy as usize) < h {
+                out.px[dy as usize * w2 + dx] = c.px[y * c.w + x];
+            }
+        }
+    }
+    out
 }
 
 /// 2x canvas -> print bitmap (180x180 or 180x360).
@@ -578,22 +738,20 @@ pub fn preview_smooth(c: &Canvas, s: usize, tape: &Tape, opts: &PageOpts) -> (us
     let top = (h - c.h) / 2;
     let bg = media::tape_color(tape.tape_color).1.map(|v| v as u32);
     let ink = media::text_color(tape.text_color).1.map(|v| v as u32);
-    let mut rgba = vec![0u8; w * h * 4];
-    for y in 0..h {
-        for x in 0..w {
-            let a = if y >= top && y < top + c.h && x >= margin && x < margin + c.w {
-                c.px[(y - top) * c.w + (x - margin)] as u32
-            } else {
-                0
-            };
-            let o = (y * w + x) * 4;
-            for k in 0..3 {
-                rgba[o + k] = ((bg[k] * (255 - a) + ink[k] * a) / 255) as u8;
-            }
-            rgba[o + 3] = 255;
+    // Blend once per coverage value, then copy: tape colour everywhere, canvas rows on top.
+    let lut: [[u8; 4]; 256] = std::array::from_fn(|a| {
+        let a = a as u32;
+        let m = |k: usize| ((bg[k] * (255 - a) + ink[k] * a) / 255) as u8;
+        [m(0), m(1), m(2), 255]
+    });
+    let mut rgba = vec![lut[0]; w * h];
+    for y in 0..c.h {
+        let o = (top + y) * w + margin;
+        for (d, &a) in rgba[o..o + c.w].iter_mut().zip(&c.px[y * c.w..(y + 1) * c.w]) {
+            *d = lut[a as usize];
         }
     }
-    (w, h, rgba)
+    (w, h, rgba.into_flattened())
 }
 
 /// Physical length of a rendered label including both margins.
@@ -606,6 +764,13 @@ pub fn label_length_mm(bm: &Bitmap, opts: &PageOpts) -> f32 {
 pub fn canvas_length_mm(c: &Canvas, s: usize, opts: &PageOpts) -> f32 {
     let m = margin_dots(opts.margin_mm, opts.high_res) as f32 / feed_dpmm(opts.high_res);
     c.w as f32 / dpmm(s) + 2.0 * m
+}
+
+/// Save a print bitmap as the pixel-exact tape image (CLI `render`, File › Export PNG).
+pub fn save_png(bm: &Bitmap, tape: &Tape, opts: &PageOpts, path: &std::path::Path) -> Result<()> {
+    let (w, h, rgba) = preview_rgba(bm, tape, opts);
+    image::RgbaImage::from_raw(w as u32, h as u32, rgba).ok_or_else(|| anyhow!("image"))?.save(path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -708,6 +873,98 @@ mod tests {
     }
 
     #[test]
+    fn fill_clips_instead_of_panicking() {
+        let mut c = Canvas::new(4, 3);
+        c.fill(6, 1, 1, 1, 255); // glyph pixel right of the canvas (italic overhang)
+        c.fill(1, 5, 1, 1, 255);
+        c.fill(3, 0, 5, 1, 255);
+        assert_eq!(c.px.iter().filter(|&&p| p != 0).count(), 1);
+        // Italic overhang beyond the advance width (Times italic "f") used to panic.
+        let mut r = Renderer::new();
+        let t = TextBlock { text: "jff".into(), font: "Times New Roman".into(), italic: true, ..Default::default() };
+        let label = Label { blocks: vec![Block::Text(t)], ..Default::default() };
+        r.render(&label, &Tape::tze(12).unwrap(), &Vars::default(), &PageOpts::default());
+    }
+
+    #[test]
+    fn absurd_sizes_are_capped() {
+        let mut r = Renderer::new();
+        let mut label = Label { blocks: vec![Block::Spacer { mm: 1e30 }], gap_mm: 1e30, ..Default::default() };
+        label.blocks.push(Block::Spacer { mm: 5.0 });
+        let out = r.render(&label, &Tape::tze(12).unwrap(), &Vars::default(), &PageOpts::default());
+        assert!(out.bitmap.w <= 3 * 7087, "width {}", out.bitmap.w);
+    }
+
+    #[test]
+    fn gtin_check_digits_and_errors() {
+        assert_eq!(gtin("400638133393", 13, "EAN-13").unwrap(), "4006381333931");
+        assert_eq!(gtin("4006381333931", 13, "EAN-13").unwrap(), "4006381333931");
+        assert_eq!(gtin("03600029145", 12, "UPC-A").unwrap(), "036000291452");
+        assert_eq!(gtin("9638507", 8, "EAN-8").unwrap(), "96385074");
+        assert!(gtin("4006381333932", 13, "EAN-13").unwrap_err().to_string().contains("check digit is 1"));
+        for bad in ["12345", "40063813339a", "４００６３８１３３３９３", ""] {
+            assert!(gtin(bad, 13, "EAN-13").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn barcodes_upca_and_errors() {
+        use crate::label::BarcodeBlock;
+        let mut r = Renderer::new();
+        let bar = |r: &mut Renderer, kind, data: &str| {
+            r.barcode_block(&BarcodeBlock { kind, data: data.into(), show_text: false, module: 1 }, data, 64, 1)
+        };
+        // UPC-A 036000291452 = EAN-13 0036000291452 (identical bars).
+        let upc = bar(&mut r, BarKind::UpcA, "036000291452").unwrap();
+        let ean = bar(&mut r, BarKind::Ean13, "0036000291452").unwrap();
+        assert_eq!(upc.px, ean.px);
+        assert_ne!(upc.px, bar(&mut r, BarKind::Ean13, "036000291452").unwrap().px);
+        assert!(bar(&mut r, BarKind::Code39, "abc-12").is_ok());
+        let e = bar(&mut r, BarKind::Code39, "a*b").err().unwrap().to_string();
+        assert!(e.contains("'*'"), "{e}");
+        let e = bar(&mut r, BarKind::Code128, "Grüße").err().unwrap().to_string();
+        assert!(e.contains("'ü'"), "{e}");
+        assert!(bar(&mut r, BarKind::Code128, "A").is_ok());
+        assert!(bar(&mut r, BarKind::Ean8, "1234567x").is_err());
+        assert!(bar(&mut r, BarKind::UpcA, "03600029145299").is_err());
+    }
+
+    #[test]
+    fn qr_and_dm_get_quiet_zones() {
+        use crate::label::{DataMatrixBlock, DmShape};
+        let mut r = Renderer::new();
+        for w in [4, 6, 12, 24] {
+            let tape = Tape::tze(w).unwrap();
+            let h = tape.print_pins as usize;
+            let qr = r.qr_block(&QrBlock { data: "HELLO".into(), ..Default::default() }, "HELLO", h, 1).unwrap();
+            let m = h / 21; // version 1
+            let ink_cols: Vec<usize> = (0..qr.w).filter(|&x| (0..h).any(|y| qr.px[y * qr.w + x] != 0)).collect();
+            assert_eq!((ink_cols[0], qr.w - 1 - ink_cols.last().unwrap()), (4 * m, 4 * m), "{w} mm");
+            let dm = DataMatrixBlock { data: "PTL".into(), shape: DmShape::Auto };
+            let c = r.dm_block(&dm, "PTL", h, 1).unwrap();
+            let first = (0..c.w).find(|&x| (0..h).any(|y| c.px[y * c.w + x] != 0)).unwrap();
+            assert!(first > 0 && first * 2 <= c.w, "{w} mm: dm quiet {first}");
+        }
+    }
+
+    #[test]
+    fn transparent_image_never_prints_even_inverted() {
+        let mut r = Renderer::new();
+        // Transparent background with an opaque black square in the middle.
+        let img = image::GrayAlphaImage::from_fn(20, 20, |x, y| {
+            if (5..15).contains(&x) && (5..15).contains(&y) { image::LumaA([0, 255]) } else { image::LumaA([0, 0]) }
+        });
+        r.images.insert("mem:test".into(), Arc::new(img));
+        let ink = |r: &mut Renderer, invert| {
+            let ib = ImageBlock { path: "mem:test".into(), invert, ..Default::default() };
+            let c = r.image_block(&ib, 40, 1).unwrap();
+            (c.px[0], c.px[20 * c.w + 20])
+        };
+        assert_eq!(ink(&mut r, false), (0, 255));
+        assert_eq!(ink(&mut r, true), (0, 0));
+    }
+
+    #[test]
     fn preview_matches_print_geometry() {
         let mut r = Renderer::new();
         let tape = Tape::tze(24).unwrap();
@@ -722,5 +979,167 @@ mod tests {
         let (w, h, rgba) = preview_smooth(&pv.canvas, PREVIEW_SCALE, &tape, &opts);
         assert_eq!(h, 170 * PREVIEW_SCALE);
         assert_eq!(rgba.len(), w * h * 4);
+    }
+
+    #[test]
+    fn rotated_text_runs_across_narrow_tape() {
+        use crate::label::Rotation;
+        let mut r = Renderer::new();
+        let tape = Tape::tze(12).unwrap(); // 70 pins
+        let mk = |rotation| Label {
+            blocks: vec![Block::Text(TextBlock { text: "HELLO".into(), rotation, ..Default::default() })],
+            ..Default::default()
+        };
+        let (o, v) = (PageOpts::default(), Vars::default());
+        // Ink bounding box (x0, x1, y0, y1), inclusive.
+        let ink = |c: &Canvas| {
+            let on: Vec<(usize, usize)> =
+                (0..c.h).flat_map(|y| (0..c.w).map(move |x| (x, y))).filter(|&(x, y)| c.px[y * c.w + x] > 0).collect();
+            let xs = on.iter().map(|p| p.0);
+            let ys = on.iter().map(|p| p.1);
+            (xs.clone().min().unwrap(), xs.max().unwrap(), ys.clone().min().unwrap(), ys.max().unwrap())
+        };
+        let up = r.render_canvas(&mk(Rotation::R0), &tape, &v, &o, SS).canvas;
+        let (ux0, ux1, ..) = ink(&up);
+        for rot in [Rotation::R90, Rotation::R270] {
+            let out = r.render_canvas(&mk(rot), &tape, &v, &o, SS);
+            assert!(out.warnings.is_empty() && !out.overflow);
+            let c = out.canvas;
+            assert_eq!(c.h, 70 * SS);
+            let (x0, x1, y0, y1) = ink(&c);
+            assert!(y1 - y0 > 2 * (x1 - x0), "{rot:?} not taller than wide: {}x{}", x1 - x0, y1 - y0);
+            // Auto-fit: the line spans the tape height without being cut at either edge.
+            assert!(y1 - y0 > c.h * 8 / 10, "{rot:?} line only {} of {} px", y1 - y0, c.h);
+            assert!(y0 > 0 && y1 < c.h - 1, "{rot:?} clipped: rows {y0}..={y1} of {}", c.h);
+            assert!(x1 - x0 < (ux1 - ux0) / 2, "{rot:?} block not shorter along the tape");
+            let bm = r.render(&mk(rot), &tape, &v, &o).bitmap;
+            assert_eq!(bm.h, 70);
+        }
+        // 180°: same box, every pixel turned.
+        let flip = r.render_canvas(&mk(Rotation::R180), &tape, &v, &o, SS).canvas;
+        assert_eq!((flip.w, flip.h), (up.w, up.h));
+        assert!(flip.px.iter().rev().eq(up.px.iter()));
+        // Fixed size: the block length follows the line stack, empty text adds nothing.
+        let mut l = mk(Rotation::R90);
+        if let Block::Text(t) = &mut l.blocks[0] {
+            t.size_pt = Some(8.0);
+            t.text = "A\nB".into();
+        }
+        let two = r.render_canvas(&l, &tape, &v, &o, SS).canvas;
+        let (x0, x1, ..) = ink(&two);
+        assert!(x1 - x0 > 30, "two 8 pt lines side by side: {} px", x1 - x0);
+        let empty = Label { blocks: vec![Block::Text(TextBlock { rotation: Rotation::R90, ..Default::default() })], ..Default::default() };
+        assert_eq!(r.render_canvas(&empty, &tape, &v, &o, SS).canvas.w, min_lines(false) * SS);
+    }
+
+    /// Deterministic pseudo-random coverage canvas.
+    fn noise(w: usize, h: usize, seed: u32) -> Canvas {
+        let mut s = seed;
+        let px = (0..w * h).map(|_| { s = s.wrapping_mul(1_103_515_245).wrapping_add(12345); (s >> 16) as u8 }).collect();
+        Canvas { w, h, px }
+    }
+
+    #[test]
+    fn blit_and_fill_match_per_pixel_reference() {
+        let src = noise(37, 23, 1);
+        for (x, y) in [(0, 0), (5, 3), (40, 10), (69, 39), (70, 0), (0, 40), (500, 500)] {
+            let mut fast = noise(70, 40, 2);
+            let mut slow = fast.clone();
+            fast.blit(&src, x, y);
+            for sy in 0..src.h {
+                for sx in 0..src.w {
+                    if x + sx < slow.w && y + sy < slow.h {
+                        let d = &mut slow.px[(y + sy) * slow.w + x + sx];
+                        *d = (*d).max(src.px[sy * src.w + sx]);
+                    }
+                }
+            }
+            assert!(fast.px == slow.px, "blit at {x},{y}");
+        }
+        for (x, y, w, h, a) in [(3, 4, 1, 1, 200), (-1, 0, 1, 1, 255), (69, 39, 1, 1, 9), (70, 5, 1, 1, 255), (2, 2, 9, 7, 0), (-3, -2, 9, 7, 77), (60, 35, 20, 20, 255)] {
+            let mut fast = noise(70, 40, 3);
+            let mut slow = fast.clone();
+            fast.fill(x, y, w, h, a);
+            for yy in y.max(0)..(y + h).min(slow.h as i64) {
+                for xx in x.max(0)..(x + w).min(slow.w as i64) {
+                    let p = &mut slow.px[yy as usize * slow.w + xx as usize];
+                    *p = (*p).max(a);
+                }
+            }
+            assert!(fast.px == slow.px, "fill {x},{y} {w}x{h} a={a}");
+        }
+    }
+
+    #[test]
+    fn preview_smooth_matches_per_pixel_blend() {
+        let tape = Tape::from_status(12, 0x01, 0x04, 0x02).unwrap(); // coloured tape + ink
+        let opts = PageOpts::default();
+        let c = noise(300, 70 * 2, 4);
+        let (w, h, rgba) = preview_smooth(&c, 2, &tape, &opts);
+        let margin = margin_dots(opts.margin_mm, false) as usize * 2;
+        let top = (h - c.h) / 2;
+        let bg = media::tape_color(tape.tape_color).1.map(|v| v as u32);
+        let ink = media::text_color(tape.text_color).1.map(|v| v as u32);
+        for y in 0..h {
+            for x in 0..w {
+                let inside = y >= top && y < top + c.h && x >= margin && x < margin + c.w;
+                let a = if inside { c.px[(y - top) * c.w + x - margin] as u32 } else { 0 };
+                let o = (y * w + x) * 4;
+                for k in 0..3 {
+                    assert_eq!(rgba[o + k] as u32, (bg[k] * (255 - a) + ink[k] * a) / 255, "{x},{y}");
+                }
+                assert_eq!(rgba[o + 3], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_cache_is_bounded_and_transparent() {
+        let mut r = Renderer::new();
+        let tape = Tape::tze(24).unwrap();
+        let o = PageOpts::default();
+        let mk = |pt| Label {
+            blocks: vec![Block::Text(TextBlock { text: "ABCDEFGHIJKLM".into(), size_pt: Some(pt), ..Default::default() })],
+            ..Default::default()
+        };
+        let first = r.render(&mk(30.0), &tape, &Vars::default(), &o).bitmap;
+        let (mut peak, mut prev, mut cleared) = (0, 0, false);
+        for i in 0..60 {
+            // Like dragging the size control with the preview open.
+            r.render_canvas(&mk(30.0 + i as f32 * 0.5), &tape, &Vars::default(), &o, PREVIEW_SCALE);
+            let b = r.glyph_cache_bytes();
+            cleared |= b < prev;
+            (peak, prev) = (peak.max(b), b);
+        }
+        assert!(cleared, "cache never trimmed (peak {peak} bytes)");
+        assert!(peak < GLYPH_CACHE_MAX + GLYPH_CACHE_MAX / 2, "peak {peak} bytes");
+        assert_eq!(r.render(&mk(30.0), &tape, &Vars::default(), &o).bitmap, first);
+    }
+
+    #[test]
+    fn image_resize_cache_is_transparent() {
+        let img = |k: u32| {
+            Arc::new(image::GrayAlphaImage::from_fn(300, 200, |x, y| image::LumaA([((x * k + y) % 256) as u8, if x < 280 { 255 } else { 90 }])))
+        };
+        let tape = Tape::tze(12).unwrap();
+        let o = PageOpts::default();
+        let label = Label {
+            blocks: vec![Block::Image(ImageBlock { path: "mem:logo".into(), dither: true, ..Default::default() })],
+            ..Default::default()
+        };
+        let mut r = Renderer::new();
+        r.images.insert("mem:logo".into(), img(3));
+        let a = r.render(&label, &tape, &Vars::default(), &o).bitmap;
+        assert_eq!(r.resized.len(), 1);
+        assert_eq!(r.render(&label, &tape, &Vars::default(), &o).bitmap, a, "cached");
+        r.resized.clear();
+        assert_eq!(r.render(&label, &tape, &Vars::default(), &o).bitmap, a, "recomputed");
+        // A different source under the same path (reloaded file) must not hit the old entry.
+        r.images.insert("mem:logo".into(), img(7));
+        let b = r.render(&label, &tape, &Vars::default(), &o).bitmap;
+        let mut fresh = Renderer::new();
+        fresh.images.insert("mem:logo".into(), img(7));
+        assert_eq!(b, fresh.render(&label, &tape, &Vars::default(), &o).bitmap);
+        assert_ne!(a, b);
     }
 }

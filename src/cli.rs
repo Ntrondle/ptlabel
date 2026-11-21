@@ -1,8 +1,8 @@
 //! Scriptable CLI: list / status / render / print.
 
 use crate::job::{PrintJob, PrintSettings, run_job};
-use crate::label::render::{Renderer, label_length_mm, preview_rgba};
-use crate::label::{Block, Label, TextBlock, Vars};
+use crate::label::render::{Renderer, label_length_mm, save_png};
+use crate::label::{Block, Label, Rotation, TextBlock, Vars};
 use crate::proto::Tape;
 use crate::transport::{PrinterId, discovery};
 use anyhow::{Context, Result, bail};
@@ -16,15 +16,17 @@ ptlabel list                    find printers (Bluetooth + Wi-Fi)
 ptlabel status <target>         read status (target = IP/host or /dev/cu.PT-...)
 ptlabel render [opts] [text]    render to PNG (--out FILE, --tape MM)
 ptlabel print <target> [opts] [text]
-options: --label FILE.json  --copies N  --no-cut  --half-cut  --chain  --hires
+options: --label FILE.ptlabel  --copies N  --no-cut  --half-cut  --chain  --hires
          --mirror  --margin MM  --cut-every N  --tape MM  --out FILE
-text: words are joined with spaces, \\n starts a new line";
+         --rotate 90|180|270 (text only, not --label)
+text: words are joined with spaces, \\n starts a new line, -- ends the options";
 
 struct Args {
     rest: Vec<String>,
     label: Option<String>,
     out: String,
     tape: u8,
+    rotation: Rotation,
     settings: PrintSettings,
 }
 
@@ -34,6 +36,7 @@ fn parse(args: &[String]) -> Result<Args> {
         label: None,
         out: "label.png".into(),
         tape: 12,
+        rotation: Rotation::R0,
         settings: PrintSettings::default(),
     };
     let mut it = args.iter();
@@ -42,19 +45,35 @@ fn parse(args: &[String]) -> Result<Args> {
         match x.as_str() {
             "--label" => a.label = Some(val()?),
             "--out" => a.out = val()?,
-            "--tape" => a.tape = val()?.parse()?,
-            "--copies" => a.settings.copies = val()?.parse()?,
-            "--margin" => a.settings.opts.margin_mm = val()?.parse()?,
-            "--cut-every" => a.settings.opts.cut_every = val()?.parse()?,
+            "--tape" => a.tape = match val()?.as_str() {
+                "3.5" => 4, // the 3.5 mm cassette's width code
+                v => num(x, v)?,
+            },
+            "--rotate" => a.rotation = Rotation::from_degrees(num(x, &val()?)?).context("--rotate: 0, 90, 180 or 270")?,
+            "--copies" => a.settings.copies = num(x, &val()?)?,
+            "--margin" => a.settings.opts.margin_mm = num(x, &val()?)?,
+            "--cut-every" => a.settings.opts.cut_every = num(x, &val()?)?,
             "--no-cut" => a.settings.opts.auto_cut = false,
             "--half-cut" => a.settings.opts.half_cut = true,
             "--chain" => a.settings.opts.chain = true,
             "--hires" => a.settings.opts.high_res = true,
             "--mirror" => a.settings.opts.mirror = true,
+            "--" => {
+                a.rest.extend(it.cloned());
+                break;
+            }
+            // A mistyped option must not end up printed as label text.
+            o if o.starts_with("--") && o[2..].starts_with(|c: char| c.is_ascii_alphabetic()) => {
+                bail!("unknown option {o}\n\n{USAGE}")
+            }
             _ => a.rest.push(x.clone()),
         }
     }
     Ok(a)
+}
+
+fn num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T> {
+    v.trim().parse().ok().with_context(|| format!("{flag} needs a number, got {v:?}"))
 }
 
 fn label_from(a: &Args, words: &[String]) -> Result<Label> {
@@ -66,12 +85,16 @@ fn label_from(a: &Args, words: &[String]) -> Result<Label> {
         bail!("no text or --label given");
     }
     Ok(Label {
-        blocks: vec![Block::Text(TextBlock { text, ..Default::default() })],
+        blocks: vec![Block::Text(TextBlock { text, rotation: a.rotation, ..Default::default() })],
         ..Default::default()
     })
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
+    if args.iter().take_while(|a| *a != "--").any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let a = parse(&args[1..])?;
     match args[0].as_str() {
         "list" => {
@@ -104,7 +127,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
         "render" => {
             let label = label_from(&a, &a.rest)?;
-            let tape = Tape::tze(a.tape).with_context(|| format!("unknown tape width {}", a.tape))?;
+            let tape = Tape::tze(a.tape).with_context(|| format!("unknown tape width {} (3.5, 6, 9, 12, 18 or 24)", a.tape))?;
             let t0 = std::time::Instant::now();
             let mut r = Renderer::new();
             let t1 = t0.elapsed();
@@ -116,10 +139,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             if out.overflow {
                 eprintln!("warning: content is longer than the fixed length");
             }
-            let (w, h, rgba) = preview_rgba(&out.bitmap, &tape, &a.settings.opts);
-            image::RgbaImage::from_raw(w as u32, h as u32, rgba)
-                .context("image")?
-                .save(&a.out)?;
+            save_png(&out.bitmap, &tape, &a.settings.opts, std::path::Path::new(&a.out))?;
             println!(
                 "{} -> {}x{} dots, {:.1} mm long (fonts {:?}, render {:?})",
                 a.out,
@@ -147,4 +167,31 @@ pub fn run(args: Vec<String>) -> Result<()> {
         other => bail!("unknown command {other}\n\n{USAGE}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn parses_options_and_text() {
+        let a = parse(&args("192.168.1.160 --copies 3 --half-cut --tape 3.5 --margin 5 Hello\\nworld")).unwrap();
+        assert_eq!((a.settings.copies, a.settings.opts.half_cut, a.tape, a.settings.opts.margin_mm), (3, true, 4, 5.0));
+        assert_eq!(a.rest, ["192.168.1.160", "Hello\\nworld"]);
+        assert_eq!(label_from(&a, &a.rest[1..]).unwrap().blocks[0], Block::Text(TextBlock { text: "Hello\nworld".into(), ..Default::default() }));
+        assert_eq!(parse(&args("-5V --> -- --copies")).unwrap().rest, ["-5V", "-->", "--copies"]);
+    }
+
+    #[test]
+    fn rejects_bad_options() {
+        let err = |s: &str| parse(&args(s)).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(err("x --copis 3").starts_with("unknown option --copis"), "typo was printed as text");
+        assert_eq!(err("x --copies abc"), "--copies needs a number, got \"abc\"");
+        assert_eq!(err("x --tape"), "--tape needs a value");
+        assert!(run(args("render --help")).is_ok(), "help, not a label saying --help");
+    }
 }

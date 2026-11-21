@@ -236,4 +236,93 @@ mod tests {
         assert_eq!(out[z + 11], 1); // not the first page
         assert_eq!(*out.last().unwrap(), 0x0C);
     }
+
+    /// Decode the raster section (after `M 02`) back to 16-byte lines; returns (lines, terminator).
+    fn decode_raster(page: &[u8]) -> (Vec<[u8; LINE_BYTES]>, u8) {
+        let mut i = page.windows(2).position(|w| w == [0x4D, 0x02]).unwrap() + 2;
+        let mut lines = Vec::new();
+        loop {
+            match page[i] {
+                0x5A => {
+                    lines.push([0; LINE_BYTES]);
+                    i += 1;
+                }
+                0x47 => {
+                    let k = u16::from_le_bytes([page[i + 1], page[i + 2]]) as usize;
+                    assert!(k <= LINE_BYTES + 1, "G length {k}");
+                    let d = packbits::decode(&page[i + 3..i + 3 + k]);
+                    lines.push(d.try_into().unwrap());
+                    i += 3 + k;
+                }
+                t => {
+                    assert_eq!(i + 1, page.len(), "trailing bytes after {t:02X}");
+                    return (lines, t);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raster_lines_roundtrip() {
+        let tape = Tape::tze(12).unwrap();
+        let mut bm = Bitmap::new(64, 70);
+        for x in 0..bm.w {
+            for y in 0..bm.h {
+                bm.px[y * bm.w + x] = ((x * 7 + y * 3) % 11 < x % 5) as u8;
+            }
+        }
+        let mut out = Vec::new();
+        encode_page(&mut out, &bm, &tape, &PageOpts::default(), Caps::default(), 0, true);
+        let z = out.windows(3).position(|w| w == [0x1B, 0x69, 0x7A]).unwrap();
+        assert_eq!(u32::from_le_bytes(out[z + 7..z + 11].try_into().unwrap()), 64);
+        let (lines, term) = decode_raster(&out);
+        assert_eq!(term, 0x1A);
+        assert_eq!(lines.len(), 64);
+        for (x, l) in lines.iter().enumerate() {
+            assert_eq!(*l, raster_line(&bm, x, tape.pin_offset()), "line {x}");
+            // Pins outside the 12 mm print area (0..29, 99..128) stay blank.
+            let bits = u128::from_be_bytes(*l);
+            assert_eq!(bits & ((1 << 29) - 1), 0);
+            assert_eq!(bits >> 99, 0);
+        }
+    }
+
+    #[test]
+    fn margins_and_lengths_follow_spec() {
+        // 2.3.3: 2..127 mm = 14..900 dots at 180 dpi, 28..1800 dots at 180x360.
+        assert_eq!(margin_dots(2.0, false), 14);
+        assert_eq!(margin_dots(2.0, true), 28);
+        assert_eq!(margin_dots(127.0, false), 900);
+        assert_eq!(margin_dots(127.0, true), 1800);
+        assert_eq!(margin_dots(0.0, true), 28);
+        assert_eq!(margin_dots(500.0, true), 1800);
+        // 2.3.4: minimum 4.4 mm (31 dots) / 4.2 mm (60 dots at 360).
+        assert_eq!((min_lines(false), min_lines(true)), (31, 60));
+
+        let tape = Tape::tze(24).unwrap();
+        let bm = Bitmap::new(120, 128);
+        let mut out = Vec::new();
+        let opts = PageOpts { high_res: true, ..Default::default() };
+        encode_page(&mut out, &bm, &tape, &opts, Caps::default(), 0, true);
+        let k = out.windows(3).position(|w| w == [0x1B, 0x69, 0x4B]).unwrap();
+        assert_eq!(out[k + 3], 0x48); // no-chain + high-res
+        let d = out.windows(3).position(|w| w == [0x1B, 0x69, 0x64]).unwrap();
+        assert_eq!(&out[d + 3..d + 5], &[28, 0]);
+    }
+
+    #[test]
+    fn heat_shrink_print_info_and_area() {
+        let tape = Tape::from_status(18, 0x11, 0x70, 0x08).unwrap(); // HS 17.7 mm: 106 pins at 11
+        let mut bm = Bitmap::new(31, 106);
+        bm.px[0] = 1; // top row -> pin 116
+        bm.px[105 * 31] = 1; // bottom row -> pin 11
+        let mut out = Vec::new();
+        encode_page(&mut out, &bm, &tape, &PageOpts::default(), Caps::default(), 3, false);
+        assert_eq!(&out[4..13], &[0x1B, 0x69, 0x7A, 0x86, 0x11, 18, 0, 31, 0]);
+        assert_eq!(out[15], 1); // page 4 is an "other" page
+        let (lines, term) = decode_raster(&out);
+        assert_eq!(term, 0x0C);
+        assert_eq!(u128::from_be_bytes(lines[0]), (1 << 116) | (1 << 11));
+        assert!(lines[1..].iter().all(|l| *l == [0; LINE_BYTES]));
+    }
 }

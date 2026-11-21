@@ -184,7 +184,8 @@ pub fn text_color(code: u8) -> (&'static str, [u8; 3]) {
         0xF0 => ("cleaning", [120, 120, 120]),
         0xF1 => ("stencil", [90, 90, 90]),
         0xFF => ("incompatible", [90, 90, 90]),
-        _ => ("black", [16, 16, 18]),
+        // Undefined code: render as black ink but don't claim it is black.
+        _ => ("unknown", [16, 16, 18]),
     }
 }
 
@@ -209,5 +210,44 @@ mod tests {
         assert_eq!(t.print_pins, 44);
         let t = Tape::from_status(24, 0x11, 0x70, 0x08).unwrap();
         assert_eq!(t.print_pins, 128);
+    }
+
+    #[test]
+    fn left_margin_pins_match_spec_tables() {
+        // Raster Command Reference 2.3.5: (status width, media type, print pins, left-margin pins).
+        let cases = [
+            (4, 0x01, 24, 52),
+            (6, 0x01, 32, 48),
+            (9, 0x03, 50, 39),
+            (12, 0x01, 70, 29),
+            (18, 0x01, 112, 8),
+            (24, 0x01, 128, 0),
+            (6, 0x11, 28, 50),
+            (9, 0x11, 48, 40),
+            (12, 0x11, 66, 31),
+            (18, 0x11, 106, 11),
+            (24, 0x11, 128, 0),
+            (5, 0x17, 20, 54),
+            (9, 0x17, 44, 42),
+            (11, 0x17, 50, 39),
+            (21, 0x17, 120, 4),
+        ];
+        for (w, kind, pins, left) in cases {
+            let t = Tape::from_status(w, kind, 0x01, 0x08).unwrap();
+            assert_eq!((t.print_pins, t.pin_offset()), (pins, left), "width {w} kind {kind:#x}");
+        }
+        assert!(Tape::from_status(0, 0x01, 0x01, 0x08).is_none());
+        assert!(Tape::from_status(12, 0x00, 0x01, 0x08).is_none());
+        assert!(Tape::from_status(36, 0x01, 0x01, 0x08).is_none());
+    }
+
+    #[test]
+    fn unknown_colours_are_not_named() {
+        assert_eq!(tape_color(0x0A).0, "unknown");
+        assert_eq!(text_color(0x03).0, "unknown");
+        assert_eq!(text_color(0x0A).0, "gold");
+        assert_eq!(text_color(0xFF).0, "incompatible");
+        assert_eq!(MediaKind::from_code(0xFF).unwrap().label(), "incompatible");
+        assert_eq!(MediaKind::from_code(0x42).unwrap().label(), "unknown media");
     }
 }

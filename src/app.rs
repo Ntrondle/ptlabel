@@ -1,8 +1,9 @@
 //! egui front end: printer bar, live preview, block editor, print panel.
 
 use crate::data::{self, DataSource, Record, Table};
+use crate::history::{self, History};
 use crate::job::{Pager, PrintJob, PrintSettings};
-use crate::label::render::{PREVIEW_SCALE, Renderer, canvas_length_mm, preview_smooth};
+use crate::label::render::{PREVIEW_SCALE, Renderer, canvas_length_mm, preview_smooth, save_png};
 use crate::icons::{self, Icon};
 use crate::menu::MenuCmd;
 use crate::label::{
@@ -31,12 +32,16 @@ fn window_icon() -> egui::IconData {
     egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
 }
 
-pub fn run() -> anyhow::Result<()> {
-    // PTLABEL_PROFILE=x runs with its own saved state ("PTLabel-x"), e.g. for testing.
-    let name = match std::env::var("PTLABEL_PROFILE") {
+/// PTLABEL_PROFILE=x runs with its own saved state ("PTLabel-x"), e.g. for testing.
+fn app_name() -> String {
+    match std::env::var("PTLABEL_PROFILE") {
         Ok(p) if !p.is_empty() => format!("PTLabel-{p}"),
         _ => "PTLabel".to_string(),
-    };
+    }
+}
+
+pub fn run() -> anyhow::Result<()> {
+    let name = app_name();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&name)
@@ -65,6 +70,8 @@ struct Persist {
     hosts: Vec<String>,
     offline_tape: u8,
     doc_path: Option<String>,
+    /// File › Open Recent, most recent first.
+    recent: Vec<String>,
     /// Selected spreadsheet rows (indices into the loaded table).
     sel_rows: Vec<usize>,
 }
@@ -79,6 +86,7 @@ impl Default for Persist {
             hosts: vec![],
             offline_tape: 12,
             doc_path: None,
+            recent: vec![],
             sel_rows: vec![],
         }
     }
@@ -138,6 +146,46 @@ struct Preview {
     warnings: Vec<String>,
 }
 
+/// Render the preview texture. Runs on a worker thread: at 720 dpi it takes ~10-20 ms for a
+/// typical label and several times that for long ones, which used to stall every keystroke.
+#[allow(clippy::too_many_arguments)]
+fn render_preview(
+    ctx: &egui::Context,
+    renderer: &Mutex<Renderer>,
+    key: u64,
+    label: &Label,
+    tape: &Tape,
+    vars: &Vars,
+    opts: &crate::proto::PageOpts,
+    max_side: usize,
+) -> Preview {
+    let mut r = renderer.lock().unwrap_or_else(|e| e.into_inner());
+    // Smooth high-res render; drop the scale for very long labels so the texture fits.
+    let mut s = PREVIEW_SCALE;
+    let out = loop {
+        let o = r.render_canvas(label, tape, vars, opts, s);
+        let w = o.canvas.w + 2 * crate::proto::raster::margin_dots(opts.margin_mm, false) as usize * s;
+        if w <= max_side || s == 1 {
+            break o;
+        }
+        s /= 2;
+    };
+    drop(r);
+    let (full_w, hh, rgba) = preview_smooth(&out.canvas, s, tape, opts);
+    // Still wider than a GPU texture at 1× (wgpu panics, egui debug-asserts): show the start.
+    let (w, rgba) = crop_width(rgba, full_w, hh, max_side);
+    let mut warnings = out.warnings;
+    if w < full_w {
+        warnings.push(format!("Preview shows the first {:.0} mm only", w as f32 / s as f32 * 25.4 / 180.0));
+    }
+    let img = egui::ColorImage::from_rgba_unmultiplied([w, hh], &rgba);
+    let len_mm = canvas_length_mm(&out.canvas, s, opts);
+    let phys = [w as f32 / s as f32, hh as f32 / s as f32];
+    let filter = TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
+    let tex = ctx.load_texture("preview", img, filter);
+    Preview { key, tex, phys, len_mm, overflow: out.overflow, warnings }
+}
+
 pub struct App {
     p: Persist,
     renderer: Arc<Mutex<Renderer>>,
@@ -151,10 +199,20 @@ pub struct App {
     stopping: bool,
     msg: Option<(String, bool, Instant)>,
     preview: Option<Preview>,
+    /// Preview render running on a worker thread.
+    preview_job: Option<crossbeam_channel::Receiver<Preview>>,
     new_host: String,
     notify: Arc<dyn Fn() + Send + Sync>,
     speller: Speller,
     menu_rx: Option<crossbeam_channel::Receiver<MenuCmd>>,
+    /// Undo/redo of `p.label`.
+    history: History<Label>,
+    /// Focused widget last frame: focus moving ends an undo step.
+    last_focus: Option<egui::Id>,
+    /// Key events for egui's next frame (Edit › Undo while a text field has focus).
+    forward: Vec<egui::Event>,
+    /// Window title last set.
+    title: String,
     /// Right-clicked misspelling: (block index, word, suggestions).
     spell_target: Option<(usize, Miss, Vec<String>)>,
     /// Loaded spreadsheet for `p.label.data`.
@@ -163,9 +221,11 @@ pub struct App {
     table_filter: String,
     /// Row shown in the preview (last clicked).
     preview_row: Option<usize>,
-    /// Last clicked visible row, for ⇧-click ranges.
+    /// Last clicked sheet row (index into `table.rows`), for ⇧-click ranges.
     last_click: Option<usize>,
     data_checked: Instant,
+    /// The label as last opened/saved (or new); differs from `p.label` = unsaved changes.
+    saved: Label,
 }
 
 fn rgb(c: [u8; 3]) -> Color32 {
@@ -191,6 +251,7 @@ impl App {
             s.spacing.item_spacing = egui::vec2(8.0, 6.0);
             s.spacing.button_padding = egui::vec2(8.0, 4.0);
         });
+        let history = History::new(p.label.clone());
         let mut app = Self {
             p,
             renderer: Arc::new(Mutex::new(renderer)),
@@ -204,10 +265,15 @@ impl App {
             stopping: false,
             msg: None,
             preview: None,
+            preview_job: None,
             new_host: String::new(),
             notify,
             speller: Speller::new(),
             menu_rx: crate::menu::install(&cc.egui_ctx),
+            history,
+            last_focus: None,
+            forward: vec![],
+            title: String::new(),
             spell_target: None,
             table: None,
             table_err: None,
@@ -215,8 +281,14 @@ impl App {
             preview_row: None,
             last_click: None,
             data_checked: Instant::now(),
+            saved: Label::default(),
         };
+        // Restored label vs. its file on disk (missing/unreadable file = unsaved).
+        if let Some(l) = app.p.doc_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()) {
+            app.saved = l;
+        }
         app.reload_table();
+        app.refresh_recent();
         if let Some(id) = app.p.printer.clone() {
             app.connect(id);
         }
@@ -240,6 +312,17 @@ impl App {
 
     fn warn_dropped_jobs(&mut self) {
         let n = self.handle.as_ref().map_or(0, |h| h.queued().len());
+        if let Some(h) = &self.handle {
+            // The old worker only exits after its current job (an ∞ one never ends) and may still
+            // pop a queued job if it is mid-poll: empty the queue and stop the job, which the UI
+            // can't reach any more once the handle is gone.
+            h.clear();
+            if let Some(r) = &self.job {
+                h.stop();
+                let t = r.title.clone();
+                self.info(format!("Stopping {t} after the current label (printer changed)"));
+            }
+        }
         if n > 0 {
             self.error(format!("{n} queued job{} discarded (printer changed)", if n == 1 { "" } else { "s" }));
         }
@@ -321,6 +404,12 @@ impl App {
                         if let Some(p) = &mut self.p.printer {
                             if p.model != m {
                                 p.model = m.into();
+                            }
+                        }
+                        // caps() falls back to the handle's name while offline ("Wi-Fi P-touch" for an IP).
+                        if let Some(h) = &mut self.handle {
+                            if h.id.model != m {
+                                h.id.model = m.into();
                             }
                         }
                     }
@@ -422,6 +511,10 @@ impl App {
         match data::load(src) {
             Ok(t) => {
                 let n = t.rows.len();
+                if let Some(old) = &self.table {
+                    self.p.sel_rows = remap_rows(&old.rows, &t.rows, &self.p.sel_rows);
+                    self.preview_row = self.preview_row.and_then(|r| remap_rows(&old.rows, &t.rows, &[r]).first().copied());
+                }
                 self.p.sel_rows.retain(|&r| r < n);
                 if self.preview_row.is_some_and(|r| r >= n) {
                     self.preview_row = None;
@@ -615,8 +708,33 @@ impl App {
             Ok(()) => {
                 self.info(format!("Saved {}", path.display()));
                 self.p.doc_path = Some(path.display().to_string());
+                self.saved = self.p.label.clone();
+                self.history.commit(&self.p.label);
+                self.add_recent(&path.display().to_string());
             }
             Err(e) => self.error(format!("Save failed: {e}")),
+        }
+    }
+
+    /// Before the label is replaced (New/Open): offer to save unsaved changes. False = cancel.
+    fn confirm_discard(&mut self) -> bool {
+        if self.p.label == self.saved {
+            return true;
+        }
+        let save = "Save".to_string();
+        let r = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description("Save the current label before replacing it?")
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(save.clone(), "Don't Save".into(), "Cancel".into()))
+            .show();
+        match r {
+            rfd::MessageDialogResult::Custom(c) if c == save => {
+                self.save(false);
+                self.p.label == self.saved // cancelled or failed save keeps the label
+            }
+            rfd::MessageDialogResult::Custom(c) => c == "Don't Save",
+            _ => false,
         }
     }
 
@@ -624,25 +742,116 @@ impl App {
         let Some(path) = rfd::FileDialog::new().add_filter("Label", &["ptlabel", "json"]).pick_file() else {
             return;
         };
+        self.open_path(path);
+    }
+
+    fn open_path(&mut self, path: std::path::PathBuf) {
         match std::fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
             .and_then(|s| serde_json::from_str::<Label>(&s).map_err(Into::into))
         {
             Ok(l) => {
+                if !self.confirm_discard() {
+                    return;
+                }
+                self.saved = l.clone();
                 self.p.label = l;
                 self.p.sel_rows.clear();
                 self.preview_row = None;
+                self.last_click = None;
                 self.reload_table();
                 self.p.doc_path = Some(path.display().to_string());
+                self.history = History::new(self.p.label.clone());
+                self.add_recent(&path.display().to_string());
                 self.info(format!("Opened {}", path.display()));
             }
             Err(e) => self.error(format!("Open failed: {e}")),
         }
     }
 
+    /// The label as previewed (current values / first row) as a pixel-exact PNG, like `ptlabel render`.
+    fn export_png(&mut self) {
+        let stem = self.p.doc_path.as_deref().and_then(|p| std::path::Path::new(p).file_stem());
+        let name = format!("{}.png", stem.map_or("label".into(), |s| s.to_string_lossy()));
+        let Some(path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name(name).save_file() else {
+            return;
+        };
+        let (tape, vars, opts) = (self.tape(), self.preview_vars(), &self.p.settings.opts);
+        let out = self.renderer.lock().unwrap_or_else(|e| e.into_inner()).render(&self.p.label, &tape, &vars, opts);
+        match save_png(&out.bitmap, &tape, opts, &path) {
+            Ok(()) if out.warnings.is_empty() => self.info(format!("Exported {}", path.display())),
+            Ok(()) => self.error(format!("Exported {} · {}", path.display(), out.warnings.join("; "))),
+            Err(e) => self.error(format!("Export failed: {e}")),
+        }
+    }
+
+    /// Put `path` first in File › Open Recent.
+    fn add_recent(&mut self, path: &str) {
+        history::push_recent(&mut self.p.recent, path);
+        self.refresh_recent();
+    }
+
+    /// Drop recent files that are gone and update the menu.
+    fn refresh_recent(&mut self) {
+        history::prune_recent(&mut self.p.recent);
+        crate::menu::set_recent(&self.p.recent);
+    }
+
+    // ---------------------------------------------------------------- undo
+
+    /// Feed the label to the undo history once per frame, before the UI edits it. A pointer press
+    /// or a focus change ends the current step; a drag ends once the pointer is released.
+    fn track_edits(&mut self, ctx: &egui::Context) {
+        let focus = ctx.memory(|m| m.focused());
+        let (pressed, down) = ctx.input(|i| (i.pointer.any_pressed(), i.pointer.any_down()));
+        let boundary = pressed || focus != self.last_focus;
+        self.last_focus = focus;
+        self.history.observe(&self.p.label, Instant::now(), down, boundary);
+    }
+
+    /// Undo (`back`) or redo a label edit.
+    fn undo(&mut self, back: bool) {
+        let step = if back { self.history.undo(&self.p.label) } else { self.history.redo(&self.p.label) };
+        let Some(l) = step else { return };
+        let data_changed = l.data != self.p.label.data;
+        self.p.label = l;
+        self.spell_target = None;
+        if data_changed {
+            self.p.sel_rows.clear();
+            self.preview_row = None;
+            self.last_click = None;
+            self.reload_table();
+        }
+    }
+
+    /// Window title: document name, plus "Edited" while the label differs from the saved file.
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let mut t = app_name();
+        if let Some(n) = self.p.doc_path.as_deref().and_then(|p| std::path::Path::new(p).file_name()) {
+            t += &format!(" — {}", n.to_string_lossy());
+        }
+        if self.p.label != self.saved {
+            t += " — Edited";
+        }
+        if t != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(t.clone()));
+            self.title = t;
+        }
+    }
+
     // ---------------------------------------------------------------- preview
 
     fn update_preview(&mut self, ctx: &egui::Context) {
+        // One render at a time, off the UI thread; when it lands (and wakes the UI), the
+        // newest state is rendered next if it changed meanwhile.
+        if let Some(rx) = &self.preview_job {
+            match rx.try_recv() {
+                Ok(p) => self.preview = Some(p),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {}
+            }
+            self.preview_job = None;
+        }
         let tape = self.tape();
         let vars = self.preview_vars();
         let opts = &self.p.settings.opts;
@@ -658,47 +867,23 @@ impl App {
         if self.preview.as_ref().is_some_and(|p| p.key == key) {
             return;
         }
-        let Ok(mut r) = self.renderer.try_lock() else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            return;
-        };
-        // Smooth high-res render; drop the scale for very long labels so the texture fits.
         let max_side = ctx.input(|i| i.max_texture_side);
-        let mut s = PREVIEW_SCALE;
-        let out = loop {
-            let o = r.render_canvas(&self.p.label, &tape, &vars, opts, s);
-            let w = o.canvas.w + 2 * crate::proto::raster::margin_dots(opts.margin_mm, false) as usize * s;
-            if w <= max_side || s == 1 {
-                break o;
-            }
-            s /= 2;
-        };
-        drop(r);
-        let (w, hh, rgba) = preview_smooth(&out.canvas, s, &tape, opts);
-        let img = egui::ColorImage::from_rgba_unmultiplied([w, hh], &rgba);
-        let len_mm = canvas_length_mm(&out.canvas, s, opts);
-        let phys = [w as f32 / s as f32, hh as f32 / s as f32];
-        let filter = TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
-        match &mut self.preview {
-            Some(p) => {
-                p.tex.set(img, filter);
-                p.key = key;
-                p.phys = phys;
-                p.len_mm = len_mm;
-                p.overflow = out.overflow;
-                p.warnings = out.warnings;
-            }
-            None => {
-                self.preview = Some(Preview {
-                    key,
-                    tex: ctx.load_texture("preview", img, filter),
-                    phys,
-                    len_mm,
-                    overflow: out.overflow,
-                    warnings: out.warnings,
-                });
-            }
+        let (renderer, label, opts) = (self.renderer.clone(), self.p.label.clone(), opts.clone());
+        if self.preview.is_none() {
+            // First frame: show the preview right away.
+            self.preview = Some(render_preview(ctx, &renderer, key, &label, &tape, &vars, &opts, max_side));
+            return;
         }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("preview".into())
+            .spawn(move || {
+                let _ = tx.send(render_preview(&ctx, &renderer, key, &label, &tape, &vars, &opts, max_side));
+                ctx.request_repaint();
+            })
+            .expect("spawn preview render");
+        self.preview_job = Some(rx);
     }
 
     // ---------------------------------------------------------------- UI parts
@@ -1105,6 +1290,9 @@ impl App {
                 }
             }
         }
+        if act.is_some() {
+            self.spell_target = None; // its block index is stale once blocks move
+        }
         let blocks = &mut self.p.label.blocks;
         match act {
             Some((i, Act::Up)) => blocks.swap(i, i - 1),
@@ -1171,6 +1359,10 @@ impl App {
                 if t.elapsed().as_secs() < 12 || *err {
                     let c = if *err { Color32::from_rgb(220, 60, 50) } else { ui.visuals().text_color() };
                     ui.colored_label(c, m);
+                    if !*err {
+                        // Hide it on time even if nothing else repaints (idle status polls don't).
+                        ui.ctx().request_repaint_after(Duration::from_secs(12).saturating_sub(t.elapsed()));
+                    }
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1186,6 +1378,7 @@ impl App {
         let shift_cmd = Modifiers::COMMAND | Modifiers::SHIFT;
         let keys = [
             (sc(shift_cmd, Key::S), MenuCmd::SaveAs),
+            (sc(shift_cmd, Key::E), MenuCmd::ExportPng),
             (sc(Modifiers::COMMAND, Key::S), MenuCmd::Save),
             (sc(Modifiers::COMMAND, Key::O), MenuCmd::Open),
             (sc(Modifiers::COMMAND, Key::N), MenuCmd::New),
@@ -1197,6 +1390,14 @@ impl App {
                 cmds.push(c);
             }
         }
+        // ⌘Z / ⇧⌘Z in a text field are its own undo (⇧ first: ⌘Z matches it too).
+        if !ctx.text_edit_focused() {
+            for (k, c) in [(sc(shift_cmd, Key::Z), MenuCmd::Redo), (sc(Modifiers::COMMAND, Key::Z), MenuCmd::Undo)] {
+                if ctx.input_mut(|i| i.consume_shortcut(&k)) {
+                    cmds.push(c);
+                }
+            }
+        }
         let mut seen = Vec::new();
         for c in cmds {
             if seen.contains(&c) {
@@ -1204,15 +1405,45 @@ impl App {
             }
             seen.push(c);
             match c {
+                MenuCmd::Undo | MenuCmd::Redo if ctx.text_edit_focused() => {
+                    // The Edit menu took the key: give it back to the text field next frame.
+                    let shift = if c == MenuCmd::Redo { Modifiers::SHIFT } else { Modifiers::NONE };
+                    let modifiers = Modifiers::COMMAND | Modifiers::MAC_CMD | shift;
+                    for pressed in [true, false] {
+                        let (key, physical_key, repeat) = (Key::Z, Some(Key::Z), false);
+                        self.forward.push(egui::Event::Key { key, physical_key, pressed, repeat, modifiers });
+                    }
+                    ctx.request_repaint();
+                }
+                MenuCmd::Undo => self.undo(true),
+                MenuCmd::Redo => self.undo(false),
+                MenuCmd::OpenRecent => {
+                    if let Some(p) = crate::menu::take_recent() {
+                        self.open_path(p.into());
+                    }
+                    self.refresh_recent();
+                }
+                MenuCmd::ClearRecent => {
+                    self.p.recent.clear();
+                    self.refresh_recent();
+                }
                 MenuCmd::New => {
+                    if !self.confirm_discard() {
+                        continue;
+                    }
                     self.p.label = Label::default();
+                    self.saved = Label::default();
                     self.p.doc_path = None;
                     self.p.sel_rows.clear();
+                    self.preview_row = None;
+                    self.last_click = None;
                     self.reload_table();
+                    self.history = History::new(self.p.label.clone());
                 }
                 MenuCmd::Open => self.open(),
                 MenuCmd::Save => self.save(false),
                 MenuCmd::SaveAs => self.save(true),
+                MenuCmd::ExportPng => self.export_png(),
                 MenuCmd::Print => self.print(),
             }
         }
@@ -1392,6 +1623,10 @@ fn style_row(ui: &mut egui::Ui, i: usize, t: &mut TextBlock, fonts: &[String], f
         ui.toggle_value(&mut t.underline, RichText::new(" U ").underline());
         ui.separator();
         align_buttons(ui, &mut t.align);
+        let turn = ui.button(format!("↻ {}°", t.rotation.degrees()));
+        if turn.on_hover_text("Rotate 90° clockwise; 90°/270° run the text across the tape").clicked() {
+            t.rotation = t.rotation.next();
+        }
         if t.text.contains('\n') {
             ui.separator();
             ui.label("Line spacing");
@@ -1540,24 +1775,71 @@ fn table_ui(
                     );
                     cells(p, rect, &t.rows[ri], if on { sel_fg } else { fg });
                     if resp.clicked() {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        match (*last, shift) {
-                            (Some(a), true) if a < visible.len() => {
-                                for &r in &visible[a.min(vi)..=a.max(vi)] {
-                                    if !sel.contains(&r) {
-                                        sel.push(r);
-                                    }
-                                }
-                            }
-                            _ if on => sel.retain(|&r| r != ri),
-                            _ => sel.push(ri),
-                        }
-                        *last = Some(vi);
+                        click_row(sel, &visible, last, vi, ui.input(|i| i.modifiers.shift));
                         *preview_row = Some(ri);
                     }
                 }
             });
     });
+}
+
+/// Row click: toggle, or ⇧ adds the range from the last clicked row. `last` is a sheet row,
+/// looked up in `visible` so the range stays right when the search filter changed in between.
+fn click_row(sel: &mut Vec<usize>, visible: &[usize], last: &mut Option<usize>, vi: usize, shift: bool) {
+    let ri = visible[vi];
+    match (last.and_then(|a| visible.iter().position(|&r| r == a)), shift) {
+        (Some(a), true) => {
+            for &r in &visible[a.min(vi)..=a.max(vi)] {
+                if !sel.contains(&r) {
+                    sel.push(r);
+                }
+            }
+        }
+        _ if sel.contains(&ri) => sel.retain(|&r| r != ri),
+        _ => sel.push(ri),
+    }
+    *last = Some(ri);
+}
+
+/// Selection after the sheet was re-read: a row that moved (rows inserted, deleted, sorted)
+/// is found again by its cells, nearest first; a row edited in place keeps its index.
+fn remap_rows(old: &[Vec<String>], new: &[Vec<String>], sel: &[usize]) -> Vec<usize> {
+    let mut by_cells: Option<std::collections::HashMap<&[String], Vec<usize>>> = None;
+    let mut taken = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(sel.len());
+    for &i in sel {
+        let j = match old.get(i) {
+            Some(row) if new.get(i) != Some(row) || taken.contains(&i) => {
+                let map = by_cells.get_or_insert_with(|| {
+                    let mut m = std::collections::HashMap::<&[String], Vec<usize>>::new();
+                    for (j, r) in new.iter().enumerate() {
+                        m.entry(r.as_slice()).or_default().push(j);
+                    }
+                    m
+                });
+                map.get(row.as_slice())
+                    .and_then(|js| js.iter().copied().filter(|j| !taken.contains(j)).min_by_key(|j| j.abs_diff(i)))
+                    .unwrap_or(i)
+            }
+            _ => i,
+        };
+        if taken.insert(j) {
+            out.push(j);
+        }
+    }
+    out
+}
+
+/// The first `max_w` columns of a `w`×`h` RGBA image.
+fn crop_width(rgba: Vec<u8>, w: usize, h: usize, max_w: usize) -> (usize, Vec<u8>) {
+    if w <= max_w {
+        return (w, rgba);
+    }
+    let mut out = Vec::with_capacity(max_w * h * 4);
+    for row in rgba.chunks_exact(w * 4) {
+        out.extend_from_slice(&row[..max_w * 4]);
+    }
+    (max_w, out)
 }
 
 fn block_icon(b: &Block) -> Icon {
@@ -1660,6 +1942,7 @@ impl eframe::App for App {
                 self.connect(id);
             }
         }
+        self.track_edits(&ctx);
         self.shortcuts(&ctx);
         self.watch_data(&ctx);
         self.update_preview(&ctx);
@@ -1683,9 +1966,82 @@ impl eframe::App for App {
                 self.blocks_ui(ui);
             });
         });
+        self.update_title(&ctx);
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        raw_input.events.append(&mut self.forward);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, KEY, &self.p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_renders_off_the_ui_thread() {
+        let ctx = egui::Context::default();
+        let renderer = Arc::new(Mutex::new(Renderer::new()));
+        let tape = Tape::tze(24).unwrap();
+        let opts = crate::proto::PageOpts::default();
+        let (c, r, o) = (ctx.clone(), renderer.clone(), opts.clone());
+        let pv = std::thread::spawn(move || render_preview(&c, &r, 7, &Label::default(), &tape, &Vars::default(), &o, 8192))
+            .join()
+            .unwrap();
+        assert_eq!(pv.key, 7);
+        assert!(pv.warnings.is_empty() && !pv.overflow);
+        assert_eq!(pv.tex.size()[1], tape.tape_dots as usize * PREVIEW_SCALE);
+        assert_eq!(pv.phys[1], tape.tape_dots as f32);
+        // A small GPU texture limit drops the scale instead of exceeding it.
+        let small = render_preview(&ctx, &renderer, 8, &Label::default(), &tape, &Vars::default(), &opts, 64);
+        assert_eq!(small.tex.size()[1], tape.tape_dots as usize);
+        assert_eq!(small.phys[1], pv.phys[1]);
+    }
+
+    fn rows(v: &[&str]) -> Vec<Vec<String>> {
+        v.iter().map(|s| vec![s.to_string()]).collect()
+    }
+
+    #[test]
+    fn shift_click_range_uses_sheet_rows_across_filter_changes() {
+        let (mut sel, mut last) = (vec![], None);
+        // Click sheet row 5 while the filter shows rows [1, 5, 9].
+        click_row(&mut sel, &[1, 5, 9], &mut last, 1, false);
+        assert_eq!((sel.clone(), last), (vec![5], Some(5)));
+        // Filter cleared: ⇧-click row 7 selects 5..=7, not a range from visible index 1.
+        let all: Vec<usize> = (0..10).collect();
+        click_row(&mut sel, &all, &mut last, 7, true);
+        assert_eq!(sel, vec![5, 6, 7]);
+        // Anchor hidden by the filter: ⇧-click just toggles.
+        click_row(&mut sel, &[2, 3], &mut last, 0, false);
+        click_row(&mut sel, &[8, 9], &mut last, 1, true);
+        assert_eq!(sel, vec![5, 6, 7, 2, 9]);
+    }
+
+    #[test]
+    fn reload_keeps_selected_rows_when_rows_move() {
+        let old = rows(&["A", "B", "C", "D"]);
+        // Row inserted above (D fell off the end): A and C are found one row lower.
+        let new = rows(&["X", "A", "B", "C"]);
+        assert_eq!(remap_rows(&old, &new, &[0, 2]), vec![1, 3]);
+        // Edited in place: keeps its index.
+        let edited = rows(&["A", "B2", "C", "D"]);
+        assert_eq!(remap_rows(&old, &edited, &[1, 3]), vec![1, 3]);
+        // Identical rows map to distinct targets.
+        let dup = rows(&["Q", "Q"]);
+        assert_eq!(remap_rows(&dup, &rows(&["Z", "Q", "Q"]), &[0, 1]), vec![1, 2]);
+    }
+
+    #[test]
+    fn crop_keeps_first_columns() {
+        let px: Vec<u8> = (0..2 * 3 * 4).map(|v| v as u8).collect(); // 3 wide, 2 high
+        let (w, out) = crop_width(px.clone(), 3, 2, 2);
+        assert_eq!(w, 2);
+        assert_eq!(out, [&px[0..8], &px[12..20]].concat());
+        assert_eq!(crop_width(px.clone(), 3, 2, 8), (3, px));
     }
 }

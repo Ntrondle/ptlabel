@@ -75,18 +75,20 @@ pub fn mtime(path: &str) -> Option<SystemTime> {
 
 pub fn load(src: &DataSource) -> Result<Table> {
     let path = Path::new(&src.path);
+    // Stat before reading: a save that lands during the read leaves an older mtime, so it reloads again.
+    let modified = mtime(&src.path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let (sheets, sheet, grid, first_row) = if matches!(ext.as_str(), "csv" | "tsv" | "txt") {
+    let (sheets, sheet, grid, first) = if matches!(ext.as_str(), "csv" | "tsv" | "txt") {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let text = String::from_utf8_lossy(&bytes);
-        (vec![], String::new(), parse_csv(text.trim_start_matches('\u{feff}')), 0)
+        (vec![], String::new(), parse_csv(&decode(&bytes)), (0, 0))
     } else {
         read_sheet(path, &src.sheet)?
     };
-    Ok(build(grid, first_row, src.header, sheets, sheet, mtime(&src.path)))
+    Ok(build(grid, first, src.header, sheets, sheet, modified))
 }
 
-type Sheet = (Vec<String>, String, Vec<Vec<String>>, usize);
+/// (sheet names, loaded sheet, cells, (row, column) of the first cell).
+type Sheet = (Vec<String>, String, Vec<Vec<String>>, (usize, usize));
 
 fn read_sheet(path: &Path, want: &str) -> Result<Sheet> {
     use calamine::{Reader, open_workbook_auto};
@@ -97,9 +99,9 @@ fn read_sheet(path: &Path, want: &str) -> Result<Sheet> {
         None => sheets.first().cloned().ok_or_else(|| anyhow!("the file has no sheets"))?,
     };
     let range = wb.worksheet_range(&name).map_err(|e| anyhow!("{e}"))?;
-    let first_row = range.start().map_or(0, |(r, _)| r as usize);
+    let first = range.start().map_or((0, 0), |(r, c)| (r as usize, c as usize));
     let grid = range.rows().map(|r| r.iter().map(cell).collect()).collect();
-    Ok((sheets, name, grid, first_row))
+    Ok((sheets, name, grid, first))
 }
 
 fn cell(d: &calamine::Data) -> String {
@@ -110,43 +112,114 @@ fn cell(d: &calamine::Data) -> String {
         Data::Int(i) => i.to_string(),
         Data::Float(f) => number(*f),
         Data::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
-        Data::DateTime(dt) => excel_date(dt.as_f64(), dt.is_datetime()),
-        Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
-        Data::Error(e) => format!("#{e}"),
+        Data::DateTime(dt) => excel_date(dt),
+        Data::DateTimeIso(s) => iso_date(s),
+        Data::DurationIso(s) => iso_duration(s),
+        Data::Error(e) => e.to_string(), // already "#DIV/0!" etc.
     }
 }
 
-/// Excel stores 1001 as 1001.0 and 0.1+0.2 as 0.30000000000000004; print what Excel shows.
+/// Excel stores 1001 as 1001.0 and 0.1+0.2 as 0.30000000000000004; print what Excel shows
+/// (whole numbers exactly, others to Excel's 15 significant digits).
 fn number(f: f64) -> String {
-    if f.fract() == 0.0 && f.abs() < 1e15 {
+    if f.fract() == 0.0 && f.abs() < 9e18 {
         return format!("{}", f as i64);
     }
-    let s = format!("{f:.10}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    let r: f64 = format!("{f:.14e}").parse().unwrap_or(f);
+    format!("{r}")
 }
 
-/// Excel serial date (days since 1899-12-30) as ISO date, plus time if it has one.
-fn excel_date(serial: f64, is_datetime: bool) -> String {
-    let secs = (serial.fract() * 86_400.0).round() as i64;
-    let (h, m) = (secs / 3600, secs / 60 % 60);
-    if !is_datetime {
-        return format!("{h}:{m:02}"); // duration
+/// Excel date/time (1900 or 1904 epoch) as ISO date, plus the time if it has one.
+fn excel_date(dt: &calamine::ExcelDateTime) -> String {
+    let serial = dt.as_f64();
+    if !dt.is_datetime() {
+        return clock((serial * 86_400.0).round() as i64); // duration: [h]:mm
     }
-    let days = serial.trunc() as i64;
-    let base = chrono::NaiveDate::from_ymd_opt(1899, 12, 30).unwrap();
-    let date = base + chrono::Duration::days(days);
-    match (days, secs) {
-        (0, _) => format!("{h:02}:{m:02}"),
-        (_, 0) => date.format("%Y-%m-%d").to_string(),
-        _ => format!("{} {h:02}:{m:02}", date.format("%Y-%m-%d")),
+    let (y, mo, d, h, mi, s, _) = dt.to_ymd_hms_milli();
+    let time = if s == 0 { format!("{h:02}:{mi:02}") } else { format!("{h:02}:{mi:02}:{s:02}") };
+    match (serial.trunc() == 0.0, (h, mi, s)) {
+        (true, _) => time,
+        (_, (0, 0, 0)) => format!("{y:04}-{mo:02}-{d:02}"),
+        _ => format!("{y:04}-{mo:02}-{d:02} {time}"),
     }
 }
 
-/// RFC 4180-style CSV (quotes, doubled quotes, newlines in quotes). The delimiter
-/// (`,` `;` or tab) is whichever appears most in the first line.
+/// Seconds as h:mm (h:mm:ss if it has seconds); hours are not wrapped at 24.
+fn clock(secs: i64) -> String {
+    let (sign, t) = (if secs < 0 { "-" } else { "" }, secs.unsigned_abs());
+    let (h, m, s) = (t / 3600, t / 60 % 60, t % 60);
+    if s == 0 { format!("{sign}{h}:{m:02}") } else { format!("{sign}{h}:{m:02}:{s:02}") }
+}
+
+/// ODS date-value ("2023-03-15" or "2023-03-15T12:30:00") in the same form as `excel_date`.
+fn iso_date(s: &str) -> String {
+    let Some((d, t)) = s.split_once('T') else { return s.to_string() };
+    let t = t.get(..8).unwrap_or(t); // hh:mm:ss without fraction or zone
+    match t.strip_suffix(":00") {
+        Some("00:00") => d.to_string(),
+        Some(hm) if hm.len() == 5 => format!("{d} {hm}"),
+        _ => format!("{d} {t}"),
+    }
+}
+
+/// ODS time-value ("PT36H30M00S") as h:mm like an Excel duration; other forms verbatim.
+fn iso_duration(s: &str) -> String {
+    let (neg, body) = s.strip_prefix('-').map_or((false, s), |b| (true, b));
+    let Some(body) = body.strip_prefix("PT") else { return s.to_string() };
+    let (mut secs, mut num) = (0.0f64, String::new());
+    for c in body.chars() {
+        let unit = match c {
+            'H' => 3600.0,
+            'M' => 60.0,
+            'S' => 1.0,
+            _ => {
+                num.push(c);
+                continue;
+            }
+        };
+        let Ok(v) = num.parse::<f64>() else { return s.to_string() };
+        secs += v * unit;
+        num.clear();
+    }
+    if !num.is_empty() {
+        return s.to_string();
+    }
+    let secs = secs.round() as i64;
+    clock(if neg { -secs } else { secs })
+}
+
+/// Windows-1252 0x80..0x9F (the rest of the byte range is Latin-1).
+const CP1252: [char; 32] = [
+    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
+    '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
+];
+
+/// CSV bytes as text: UTF-8 (BOM optional), UTF-16 with BOM (Excel "Unicode Text"),
+/// anything else as Windows-1252 (Excel's legacy "CSV" on Windows).
+fn decode(b: &[u8]) -> String {
+    let utf16 = |unit: fn([u8; 2]) -> u16| -> String {
+        let units = b[2..].chunks_exact(2).map(|p| unit([p[0], p[1]]));
+        char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
+    };
+    match b {
+        [0xFF, 0xFE, ..] => utf16(u16::from_le_bytes),
+        [0xFE, 0xFF, ..] => utf16(u16::from_be_bytes),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => match std::str::from_utf8(b) {
+            Ok(s) => s.to_string(),
+            Err(_) => b.iter().map(|&c| if (0x80..0xA0).contains(&c) { CP1252[c as usize - 0x80] } else { c as char }).collect(),
+        },
+    }
+}
+
+/// RFC 4180-style CSV (quotes, doubled quotes, newlines in quotes; CRLF, LF or CR line
+/// ends). The delimiter (`,` `;` or tab) is whichever appears most outside quotes in the
+/// first non-empty line.
 fn parse_csv(text: &str) -> Vec<Vec<String>> {
-    let first = text.lines().next().unwrap_or("");
-    let delim = [',', ';', '\t'].into_iter().max_by_key(|d| first.matches(*d).count()).unwrap_or(',');
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let count = |d: char| first.split('"').step_by(2).map(|s| s.matches(d).count()).sum::<usize>();
+    let delim = [',', ';', '\t'].into_iter().max_by_key(|d| count(*d)).unwrap_or(',');
     let (mut rows, mut row, mut field, mut quoted) = (Vec::new(), Vec::new(), String::new(), false);
     let mut it = text.chars().peekable();
     while let Some(c) = it.next() {
@@ -165,7 +238,6 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
         }
         match c {
             '"' if field.is_empty() => quoted = true,
-            '\r' => {}
             '\n' => {
                 row.push(std::mem::take(&mut field));
                 rows.push(std::mem::take(&mut row));
@@ -196,7 +268,7 @@ pub fn col_letter(mut i: usize) -> String {
 
 fn build(
     grid: Vec<Vec<String>>,
-    first_row: usize,
+    (first_row, first_col): (usize, usize),
     header: bool,
     sheets: Vec<String>,
     sheet: String,
@@ -218,11 +290,11 @@ fn build(
             .enumerate()
             .map(|(i, s)| {
                 let s = s.replace(['{', '}'], "").split_whitespace().collect::<Vec<_>>().join(" ");
-                if s.is_empty() { col_letter(i) } else { s }
+                if s.is_empty() { col_letter(first_col + i) } else { s }
             })
             .collect()
     } else {
-        (0..width).map(col_letter).collect()
+        (0..width).map(|i| col_letter(first_col + i)).collect()
     };
     // Duplicate names get " 2", " 3"… so every column can be addressed.
     for i in 1..headers.len() {
@@ -244,7 +316,7 @@ mod tests {
     #[test]
     fn csv_quotes_delimiters_and_headers() {
         let g = parse_csv("Part;Value;Note\r\nR1;10k;\"say \"\"hi\"\"; ok\"\n\nC1;100n;\"two\nlines\"\n");
-        let t = build(g, 0, true, vec![], String::new(), None);
+        let t = build(g, (0, 0), true, vec![], String::new(), None);
         assert_eq!(*t.headers, vec!["Part", "Value", "Note"]);
         assert_eq!(t.rows[0], vec!["R1", "10k", "say \"hi\"; ok"]);
         assert_eq!(t.rows[1][2], "two\nlines");
@@ -257,12 +329,65 @@ mod tests {
     #[test]
     fn letters_dupes_and_numbers() {
         assert_eq!((col_letter(0), col_letter(25), col_letter(26), col_letter(701)), ("A".into(), "Z".into(), "AA".into(), "ZZ".into()));
-        let t = build(vec![vec!["X".into(), "".into(), "X".into()], vec!["1".into(), "2".into(), "3".into()]], 4, true, vec![], String::new(), None);
+        let t = build(vec![vec!["X".into(), "".into(), "X".into()], vec!["1".into(), "2".into(), "3".into()]], (4, 0), true, vec![], String::new(), None);
         assert_eq!(*t.headers, vec!["X", "B", "X 2"]);
         assert_eq!(t.row_numbers, vec![6]);
         assert_eq!((number(1001.0), number(0.1 + 0.2), number(2.5)), ("1001".into(), "0.3".into(), "2.5".into()));
-        assert_eq!(excel_date(45000.0, true), "2023-03-15");
-        assert_eq!(excel_date(45000.5, true), "2023-03-15 12:00");
+        let dt = |v, ty, is_1904| excel_date(&calamine::ExcelDateTime::new(v, ty, is_1904));
+        use calamine::ExcelDateTimeType::DateTime;
+        assert_eq!(dt(45000.0, DateTime, false), "2023-03-15");
+        assert_eq!(dt(45000.5, DateTime, false), "2023-03-15 12:00");
+    }
+
+    #[test]
+    fn numbers_keep_precision_without_noise() {
+        assert_eq!(number(123456789.123), "123456789.123"); // was 123456789.1229999959
+        assert_eq!(number(1.5e-12), "0.0000000000015"); // was 0
+        assert_eq!(number(-1e-12), "-0.000000000001"); // was -0
+        assert_eq!(number(1234567890123456.0), "1234567890123456");
+        assert_eq!(number(4006381333931.0), "4006381333931");
+        assert_eq!(number(-5.0), "-5");
+        assert_eq!(number(10.0 * 1.19), "11.9");
+    }
+
+    #[test]
+    fn dates_times_and_errors() {
+        use calamine::{CellErrorType, Data, ExcelDateTime, ExcelDateTimeType::*};
+        let dt = |v, ty, is_1904| excel_date(&ExcelDateTime::new(v, ty, is_1904));
+        assert_eq!(dt(45000.0 - 1462.0, DateTime, true), "2023-03-15"); // 1904 epoch
+        assert_eq!(dt(45000.999_999_999_99, DateTime, false), "2023-03-16"); // rounds to midnight, not 24:00
+        assert_eq!(dt(0.75, DateTime, false), "18:00");
+        assert_eq!(dt(45000.5 + 15.0 / 86400.0, DateTime, false), "2023-03-15 12:00:15");
+        assert_eq!(dt(1.5, TimeDelta, false), "36:00"); // whole days were dropped
+        assert_eq!(dt(0.25, TimeDelta, false), "6:00");
+        assert_eq!(cell(&Data::Error(CellErrorType::Div0)), "#DIV/0!"); // was ##DIV/0!
+        assert_eq!(iso_date("2023-03-15"), "2023-03-15");
+        assert_eq!(iso_date("2023-03-15T00:00:00"), "2023-03-15");
+        assert_eq!(iso_date("2023-03-15T12:30:00.5"), "2023-03-15 12:30");
+        assert_eq!(iso_date("2023-03-15T12:30:15"), "2023-03-15 12:30:15");
+        assert_eq!(iso_duration("PT36H30M00S"), "36:30");
+        assert_eq!(iso_duration("PT12H05M30S"), "12:05:30");
+        assert_eq!(iso_duration("-PT1H"), "-1:00");
+        assert_eq!(iso_duration("P1DT2H"), "P1DT2H");
+    }
+
+    #[test]
+    fn csv_encodings_line_ends_and_delimiters() {
+        assert_eq!(decode(b"\xEF\xBB\xBFPart;Qty"), "Part;Qty");
+        assert_eq!(decode(b"M\xfcller;\x80 5"), "Müller;€ 5"); // Windows-1252, was M\u{fffd}ller
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain("Grüße\t😀".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        assert_eq!(decode(&utf16), "Grüße\t😀");
+        assert_eq!(parse_csv("A;B\r1;2\r3;4"), vec![vec!["A", "B"], vec!["1", "2"], vec!["3", "4"]]); // CR-only (classic Mac)
+        assert_eq!(parse_csv("A,B\r\n\"x\r\ny\",2\r\n")[1][0], "x\ny");
+        assert_eq!(parse_csv("\"Name; full\",Qty\n\"a;b\",1")[1], vec!["a;b", "1"]); // ';' inside quotes doesn't count
+        assert_eq!(parse_csv("\n\nPart;Qty\nR1;5")[3], vec!["R1", "5"]); // leading blank lines
+    }
+
+    #[test]
+    fn column_letters_follow_the_sheet_offset() {
+        let g = || vec![vec!["".to_string(), "Qty".into()], vec!["R1".into(), "5".into()]];
+        assert_eq!(*build(g(), (2, 2), true, vec![], String::new(), None).headers, vec!["C", "Qty"]);
+        assert_eq!(*build(g(), (2, 2), false, vec![], String::new(), None).headers, vec!["C", "D"]);
     }
 
     #[test]

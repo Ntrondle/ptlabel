@@ -72,7 +72,8 @@ mod imp {
                         &mut words,
                     )
                 };
-                if r.length == 0 || r.location >= len {
+                // NSNotFound = done; a range behind `offset` or past the end would loop or overflow.
+                if r.length == 0 || r.location < offset || r.location.saturating_add(r.length) > len {
                     break;
                 }
                 out.push((r.location, r.length));
@@ -154,22 +155,7 @@ impl Speller {
         if let Some(m) = self.cache.get(text) {
             return m.clone();
         }
-        let map = utf16_to_char(text);
-        let skip = placeholder_spans(text);
-        let chars: Vec<char> = text.chars().collect();
-        let misses: Vec<Miss> = self
-            .native
-            .check(text)
-            .into_iter()
-            .filter_map(|(loc, len)| {
-                let start = *map.get(loc)?;
-                let end = *map.get(loc + len)?;
-                if skip.iter().any(|&(a, b)| start < b && end > a) {
-                    return None;
-                }
-                Some(Miss { start, end, word: chars[start..end].iter().collect() })
-            })
-            .collect();
+        let misses = to_misses(text, self.native.check(text));
         if self.cache.len() > 256 {
             self.cache.clear();
         }
@@ -193,6 +179,25 @@ impl Speller {
     }
 }
 
+/// UTF-16 (location, length) ranges from the checker -> char-indexed misses, dropping
+/// ranges inside placeholders or outside `text`.
+fn to_misses(text: &str, ranges: Vec<(usize, usize)>) -> Vec<Miss> {
+    let map = utf16_to_char(text);
+    let skip = placeholder_spans(text);
+    let chars: Vec<char> = text.chars().collect();
+    ranges
+        .into_iter()
+        .filter_map(|(loc, len)| {
+            let start = *map.get(loc)?;
+            let end = *map.get(loc.checked_add(len)?)?;
+            if skip.iter().any(|&(a, b)| start < b && end > a) {
+                return None;
+            }
+            Some(Miss { start, end, word: chars[start..end].iter().collect() })
+        })
+        .collect()
+}
+
 /// Replace chars `start..end` of `text` with `with`.
 pub fn replace_chars(text: &mut String, start: usize, end: usize, with: &str) {
     let byte = |ci: usize| text.char_indices().nth(ci).map_or(text.len(), |(b, _)| b);
@@ -214,6 +219,20 @@ mod tests {
         assert!(!words.iter().any(|w| w.contains('n') && w.len() == 1));
         let brwn = m.iter().find(|x| x.word == "brwn").unwrap();
         assert!(s.suggestions("Teh quick brwn fox {n:03} café", brwn).iter().any(|g| g == "brown"));
+    }
+
+    #[test]
+    fn utf16_ranges_map_to_chars() {
+        // UTF-16: "Grüße"=0..5, 😀=6..8 (surrogate pair), "Teh"=9..12, "{n:03}"=13..19, "brwn"=20..24.
+        let text = "Grüße 😀 Teh {n:03} brwn";
+        let ranges = vec![(0, 5), (9, 3), (14, 1), (20, 4), (30, 2), (22, 5), (20, usize::MAX)];
+        let m = to_misses(text, ranges);
+        let got: Vec<(usize, usize, &str)> = m.iter().map(|x| (x.start, x.end, x.word.as_str())).collect();
+        assert_eq!(got, [(0, 5, "Grüße"), (8, 11, "Teh"), (19, 23, "brwn")]);
+        assert_eq!((char_to_utf16(text, 19), char_to_utf16(text, 23)), (20, 24));
+        let mut t = text.to_string();
+        replace_chars(&mut t, m[2].start, m[2].end, "brown");
+        assert_eq!(t, "Grüße 😀 Teh {n:03} brown");
     }
 
     #[test]

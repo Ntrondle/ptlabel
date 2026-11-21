@@ -12,6 +12,35 @@ pub enum Align {
     Right,
 }
 
+/// Text direction, clockwise. 90°/270° run the lines across the tape (top to bottom /
+/// bottom to top), which suits narrow tape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Rotation {
+    #[default]
+    R0,
+    R90,
+    R180,
+    R270,
+}
+
+impl Rotation {
+    pub const ALL: [Rotation; 4] = [Self::R0, Self::R90, Self::R180, Self::R270];
+    /// Clockwise quarter turns (0..=3).
+    pub fn quarters(self) -> u8 {
+        self as u8
+    }
+    pub fn degrees(self) -> u16 {
+        self.quarters() as u16 * 90
+    }
+    pub fn from_degrees(d: u16) -> Option<Self> {
+        (d % 90 == 0).then(|| Self::ALL[(d / 90 % 4) as usize])
+    }
+    /// Next clockwise step (270° wraps to 0°).
+    pub fn next(self) -> Self {
+        Self::ALL[(self.quarters() as usize + 1) % 4]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TextBlock {
@@ -26,6 +55,9 @@ pub struct TextBlock {
     pub align: Align,
     /// Baseline-to-baseline distance as a multiple of the font's line box.
     pub line_spacing: f32,
+    /// Missing in files saved before rotation existed: upright.
+    #[serde(default)]
+    pub rotation: Rotation,
 }
 
 impl Default for TextBlock {
@@ -39,6 +71,7 @@ impl Default for TextBlock {
             underline: false,
             align: Align::Center,
             line_spacing: 1.0,
+            rotation: Rotation::R0,
         }
     }
 }
@@ -250,8 +283,9 @@ impl Label {
         self.blocks.iter().find_map(|b| if let Block::Sequence(q) = b { Some(q) } else { None })
     }
     pub fn uses(&self, key: &str) -> bool {
-        let pat = format!("{{{key}");
-        self.blocks.iter().flat_map(|b| b.templates()).any(|t| t.contains(&pat))
+        // `{key}` or `{key:fmt}`, not `{keyword}`.
+        let (exact, fmt) = (format!("{{{key}}}"), format!("{{{key}:"));
+        self.blocks.iter().flat_map(|b| b.templates()).any(|t| t.contains(&exact) || t.contains(&fmt))
     }
 }
 
@@ -282,16 +316,23 @@ pub fn expand(s: &str, v: &Vars) -> String {
             return out;
         };
         let key = &after[..j];
+        // A stray `{` before a placeholder is literal text.
+        if let Some(k) = key.rfind('{') {
+            out.push_str(&rest[i..i + 1 + k]);
+            rest = &after[k..];
+            continue;
+        }
         let now = chrono::Local::now();
         let rep = match key {
             "n" => Some(v.n.to_string()),
             "date" => Some(now.format("%Y-%m-%d").to_string()),
             "time" => Some(now.format("%H:%M").to_string()),
             "seq" => Some(v.seq.clone()),
+            // Width capped: i64 has at most 20 chars, and a typo must not allocate gigabytes.
             k if k.starts_with("n:") => k[2..]
-                .trim_start_matches('0')
                 .parse::<usize>()
                 .ok()
+                .filter(|&w| w <= 32)
                 .map(|w| format!("{:0w$}", v.n, w = w)),
             k => v.row.as_ref().and_then(|r| r.get(k)).map(String::from),
         };
@@ -330,5 +371,37 @@ mod tests {
         assert_eq!(expand("Box {n:03} / {bin} / {Part} {seq}", &v), "Box 007 / A-12 / R1 S-01");
         assert_eq!(expand("{n}{x}{", &v), "7{x}{");
         assert_eq!(expand("plain", &v), "plain");
+    }
+
+    #[test]
+    fn rotation_is_optional_in_files() {
+        let t: TextBlock = serde_json::from_str(r#"{"text": "A", "bold": true, "align": "Left"}"#).unwrap();
+        assert_eq!(t.rotation, Rotation::R0);
+        let l: Label = serde_json::from_str(include_str!("../../examples/asset-tag.ptlabel")).unwrap();
+        assert!(matches!(&l.blocks[1], Block::Text(t) if t.rotation == Rotation::R0 && t.bold));
+        let r = TextBlock { rotation: Rotation::R270, ..Default::default() };
+        let back: TextBlock = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(Rotation::from_degrees(450), Some(Rotation::R90));
+        assert_eq!(Rotation::from_degrees(45), None);
+        assert_eq!(Rotation::R270.next(), Rotation::R0);
+    }
+
+    #[test]
+    fn expand_edge_cases() {
+        let v = Vars { n: -5, ..Default::default() };
+        assert_eq!(expand("{n:0}|{n:00}|{n:3}|{n}", &v), "-5|-5|-05|-5");
+        assert_eq!(expand("{n:99999999999}", &v), "{n:99999999999}");
+        assert_eq!(expand("{{n}} {a {n}", &v), "{-5} {a -5");
+        assert_eq!(expand("ä{ö}{n}ü{", &v), "ä{ö}-5ü{");
+        assert_eq!(expand("}{n", &v), "}{n");
+    }
+
+    #[test]
+    fn uses_matches_whole_keys() {
+        let mk = |t: &str| Label { blocks: vec![Block::Text(TextBlock { text: t.into(), ..Default::default() })], ..Default::default() };
+        assert!(mk("{n:03}").uses("n") && mk("{n}").uses("n"));
+        assert!(!mk("{name}").uses("n"));
+        assert!(!mk("{PartNo}").uses("Part") && mk("{PartNo}").uses("PartNo"));
     }
 }

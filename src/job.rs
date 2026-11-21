@@ -69,14 +69,19 @@ impl Pager {
     /// Values for page `i` (copies of one record are consecutive pages).
     pub fn vars(&self, i: u32) -> Vars {
         let mut v = self.record_vars((i / self.copies) as u64);
-        v.n = self.start + i as i64 * self.step;
+        v.n = self.start.saturating_add((i as i64).saturating_mul(self.step));
+        if let Some(q) = &self.seq {
+            // `{n}` in the prefix/suffix follows the copy, as on the rendered sequence block.
+            v.seq = q.format(v.index, &v);
+        }
         v
     }
 
     /// Values for record `index` (its first copy).
     pub fn record_vars(&self, index: u64) -> Vars {
         let row = (!self.rows.is_empty()).then(|| self.rows[index as usize % self.rows.len()].clone());
-        let n = self.start + (index * self.copies as u64) as i64 * self.step;
+        let k = i64::try_from(index.saturating_mul(self.copies as u64)).unwrap_or(i64::MAX);
+        let n = self.start.saturating_add(k.saturating_mul(self.step));
         let mut v = Vars { n, index, seq: String::new(), row };
         if let Some(q) = &self.seq {
             v.seq = q.format(index, &v);
@@ -122,7 +127,6 @@ pub fn run_job(
         let mut i = 0u32;
         let mut buf = Vec::new();
         loop {
-            let last = stop.load(Ordering::Relaxed) || pager.total.is_some_and(|t| i + 1 >= t);
             let fresh;
             let bm: &Bitmap = if static_page && cached.is_some() {
                 cached.as_ref().unwrap()
@@ -145,6 +149,8 @@ pub fn run_job(
             if bm.w as f32 / crate::proto::raster::feed_dpmm(opts.high_res) > 1000.0 {
                 bail!("label longer than 1 m");
             }
+            // Checked after rendering, so a Stop pressed meanwhile makes this label the last one.
+            let last = stop.load(Ordering::Relaxed) || pager.total.is_some_and(|t| i + 1 >= t);
             buf.clear();
             encode_page(&mut buf, bm, &tape, opts, caps, i, last);
             t.send_page(&buf, label_length_mm(bm, opts)).with_context(|| format!("label {}", i + 1))?;
@@ -193,5 +199,32 @@ mod tests {
         let inf = Pager::new(&label, &PrintSettings { infinite: true, ..Default::default() }, vec![]);
         assert_eq!(inf.total, None);
         assert_eq!(Pager::new(&Label::default(), &s, vec![]).total, Some(2));
+    }
+
+    #[test]
+    fn pager_seq_follows_copy_number() {
+        use crate::label::{Block, SequenceBlock};
+        let s = PrintSettings { copies: 2, ..Default::default() };
+        let mut label = Label::default();
+        label.blocks.push(Block::Sequence(SequenceBlock { suffix: "/{n}".into(), count: 2, digits: 1, ..Default::default() }));
+        let p = Pager::new(&label, &s, vec![]);
+        // `{seq}` (QR/barcodes) must match what the sequence block itself renders for that page.
+        for i in 0..4 {
+            let v = p.vars(i);
+            assert_eq!(v.seq, label.sequence().unwrap().format(v.index, &v), "page {i}");
+        }
+        assert_eq!([p.vars(0).seq, p.vars(1).seq, p.vars(2).seq], ["1/1", "1/2", "2/3"]);
+        assert_eq!(p.record_vars(1).seq, "2/3");
+    }
+
+    #[test]
+    fn pager_numbering_saturates_instead_of_overflowing() {
+        let s = PrintSettings { copies: 3, num_start: i64::MAX - 1, num_step: i64::MAX, ..Default::default() };
+        let p = Pager::new(&Label::default(), &s, vec![]);
+        assert_eq!(p.vars(0).n, i64::MAX - 1);
+        assert_eq!(p.vars(u32::MAX).n, i64::MAX);
+        assert_eq!(p.record_vars(u64::MAX).n, i64::MAX);
+        let neg = Pager::new(&Label::default(), &PrintSettings { num_start: i64::MIN, num_step: -1, ..Default::default() }, vec![]);
+        assert_eq!(neg.vars(5).n, i64::MIN);
     }
 }

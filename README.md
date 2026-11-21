@@ -22,6 +22,7 @@ cargo test
 - Live tape detection: width, laminated/non-laminated/heat-shrink, tape and ink colour. The layout and preview follow the loaded cassette. Polling runs every 2 s (Wi-Fi) or 3 s (Bluetooth).
 - Pixel-exact preview at 180 dpi, drawn in the cassette's colours.
 - Blocks laid out left to right: multi-line text (any installed font, auto-fit or pt size, B/I/U, alignment, line spacing), QR, Data Matrix (square or rectangular for narrow tape), Code 128/39, EAN-13/8, UPC-A, images (threshold or dither), and spacers.
+- Text rotation 0/90/180/270° per text or sequence block (↻ button). At 90°/270° the lines run across the tape and auto-fit makes the longest line fill the tape height, which helps on narrow tape.
 - Label options: auto or fixed length, alignment, gap, frame, invert.
 - Labels 1…99 999 or ∞ (until Stop or tape-out). Stop finishes the current label and cuts it.
 - **Sequence** block: prefix + number (start, step, zero-padded digits) + suffix; prints `count` labels. Its value is also `{seq}` for QR/barcodes.
@@ -30,6 +31,9 @@ cargo test
 - Cutting: auto cut; half cut and cut every N (E550W only, greyed out on the P710BT); chain printing; never cut (special tape).
 - Output: high resolution 180×360, mirror, margins 2–127 mm.
 - Save and open designs as `.ptlabel` JSON. ⌘P print, ⌘S save, ⌘O open, ⌘N new.
+- File › Export PNG… (⇧⌘E) saves the label as previewed (current values, previewed row) as a pixel-exact PNG, the same image as `ptlabel render`.
+- Undo/redo of label edits (⌘Z, ⇧⌘Z, Edit menu), up to 100 steps; a typing burst or slider drag is one step. In a text field ⌘Z undoes its own typing. The window title shows the file name and "Edited" until it is saved.
+- File › Open Recent: the last 10 opened or saved designs (missing files are dropped), with Clear Menu.
 
 ## CLI
 
@@ -37,6 +41,7 @@ cargo test
 ptlabel list
 ptlabel status 192.168.1.160
 ptlabel render --tape 24 --label examples/asset-tag.ptlabel --out tag.png
+ptlabel render --tape 6 --rotate 90 'A-12' --out bin.png
 ptlabel print 192.168.1.160 --copies 3 --half-cut 'Hello\nworld'
 ptlabel print /dev/cu.PT-P710BT6431 --label examples/asset-tag.ptlabel
 ```

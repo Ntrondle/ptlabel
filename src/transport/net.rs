@@ -35,12 +35,17 @@ impl Transport for NetTransport {
 
     fn begin(&mut self) -> Result<Status> {
         let st = self.snmp_status().context("read status via SNMP")?;
-        let addr = (self.host.as_str(), 9100)
-            .to_socket_addrs()?
-            .next()
-            .context("resolve printer address")?;
-        let s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-            .with_context(|| format!("connect {}:9100", self.host))?;
+        // Try every resolved address, IPv4 first like the SNMP socket, instead of only the first.
+        let mut addrs: Vec<_> = (self.host.as_str(), 9100).to_socket_addrs()?.collect();
+        addrs.sort_by_key(|a| a.is_ipv6());
+        let mut res = Err(std::io::Error::other("could not resolve printer address"));
+        for addr in &addrs {
+            res = TcpStream::connect_timeout(addr, Duration::from_secs(5));
+            if res.is_ok() {
+                break;
+            }
+        }
+        let s = res.with_context(|| format!("connect {}:9100", self.host))?;
         s.set_nodelay(true)?;
         s.set_write_timeout(Some(Duration::from_secs(60)))?;
         self.stream = Some(s);

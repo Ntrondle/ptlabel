@@ -72,6 +72,8 @@ impl PrinterHandle {
                     notify();
                 };
                 let mut next_poll = Instant::now();
+                // Last status or error sent: an unchanged poll doesn't wake (repaint) the UI.
+                let mut last: Option<Result<Status, String>> = None;
                 loop {
                     let wait = next_poll.saturating_duration_since(Instant::now());
                     match crx.recv_timeout(wait) {
@@ -85,19 +87,27 @@ impl PrinterHandle {
                             let st = match t.status() {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    send(Event::Offline(format!("{e:#}")));
+                                    let e = format!("{e:#}");
+                                    if last.as_ref() != Some(&Err(e.clone())) {
+                                        send(Event::Offline(e.clone()));
+                                        last = Some(Err(e));
+                                    }
                                     next_poll = Instant::now() + interval.max(Duration::from_secs(5));
                                     continue;
                                 }
                             };
                             let go = ready(&st);
-                            send(Event::Status(st));
+                            if last.as_ref() != Some(&Ok(st.clone())) {
+                                last = Some(Ok(st.clone()));
+                                send(Event::Status(st));
+                            }
                             next_poll = Instant::now() + interval;
                             if !go {
                                 continue;
                             }
-                            let Some(q) = wqueue.lock().unwrap().pop_front() else { continue };
+                            // Reset before taking the job, so a Stop from Drop can't be lost in between.
                             wstop.store(false, Ordering::SeqCst);
+                            let Some(q) = wqueue.lock().unwrap().pop_front() else { continue };
                             send(Event::Started { id: q.id, title: q.title.clone(), total: q.total });
                             let r = run_job(t.as_mut(), &renderer, &q.job, &wstop, &mut |done, total| {
                                 send(Event::Progress { id: q.id, done, total })
@@ -150,6 +160,10 @@ impl PrinterHandle {
 
 impl Drop for PrinterHandle {
     fn drop(&mut self) {
+        // Nobody is left to see or stop the jobs: drop the queue and end the running job
+        // after its current label (fed + cut), then the worker exits.
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.stop();
         let _ = self.tx.send(Cmd::Close);
     }
 }
@@ -161,17 +175,22 @@ mod tests {
     use crate::label::Label;
     use crate::proto::Caps;
     use crate::transport::Link;
-    use anyhow::Result;
+    use anyhow::{Result, anyhow};
 
     const READY: [u8; 32] = [
         0x80, 0x20, 0x42, 0x30, 0x66, 0x30, 0, 0, 0, 0, 12, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 0, 0, 0,
         0, 0, 0,
     ];
 
+    /// Runs at each sent page (1-based, counted across jobs); an error fails that page.
+    type OnPage = Box<dyn FnMut(usize) -> Result<()> + Send>;
+
     /// Fake printer: cover open for the first `cover_polls` status reads, then ready.
     struct Mock {
         cover_polls: Arc<Mutex<u32>>,
         log: Arc<Mutex<Vec<String>>>,
+        on_page: Option<OnPage>,
+        pages: usize,
     }
 
     impl Transport for Mock {
@@ -189,6 +208,10 @@ mod tests {
             Status::parse(&READY)
         }
         fn send_page(&mut self, data: &[u8], _: f32) -> Result<()> {
+            self.pages += 1;
+            if let Some(f) = &mut self.on_page {
+                f(self.pages)?;
+            }
             let last = *data.last().unwrap() == 0x1A;
             self.log.lock().unwrap().push(if last { "page-last".into() } else { "page".into() });
             std::thread::sleep(Duration::from_millis(20));
@@ -198,7 +221,12 @@ mod tests {
             self.log.lock().unwrap().push("finish".into());
             Ok(())
         }
-        fn abort(&mut self) {}
+        fn abort(&mut self) {
+            self.log.lock().unwrap().push("abort".into());
+        }
+        fn close(&mut self) {
+            self.log.lock().unwrap().push("close".into());
+        }
         fn poll_interval(&self) -> Duration {
             Duration::from_millis(10)
         }
@@ -218,7 +246,7 @@ mod tests {
         let cover = Arc::new(Mutex::new(3));
         let log = Arc::new(Mutex::new(vec![]));
         let id = PrinterId { model: "PT-E550W".into(), link: Link::Network("mock".into()) };
-        let mock = Box::new(Mock { cover_polls: cover.clone(), log: log.clone() });
+        let mock = Box::new(Mock { cover_polls: cover.clone(), log: log.clone(), on_page: None, pages: 0 });
         let mut h = PrinterHandle::spawn_with(id, mock, Arc::new(Mutex::new(Renderer::new())), Arc::new(|| {}));
         let a = h.enqueue(job(2), "A".into(), Some(2));
         let b = h.enqueue(job(1), "B".into(), Some(1));
@@ -242,5 +270,118 @@ mod tests {
             vec!["begin", "page", "page-last", "finish", "begin", "page-last", "finish"]
         );
         assert!(h.queued().is_empty());
+    }
+
+    fn spawn_mock(log: &Arc<Mutex<Vec<String>>>, on_page: Option<OnPage>) -> PrinterHandle {
+        let id = PrinterId { model: "PT-P710BT".into(), link: Link::Bluetooth("mock".into()) };
+        let mock = Box::new(Mock { cover_polls: Arc::new(Mutex::new(0)), log: log.clone(), on_page, pages: 0 });
+        PrinterHandle::spawn_with(id, mock, Arc::new(Mutex::new(Renderer::new())), Arc::new(|| {}))
+    }
+
+    fn wait_for(log: &Arc<Mutex<Vec<String>>>, entry: &str) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !log.lock().unwrap().iter().any(|e| e == entry) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        log.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn dropping_handle_ends_running_job_cleanly_and_exits() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let mut h = spawn_mock(&log, None);
+        let mut inf = job(1);
+        inf.settings.infinite = true;
+        h.enqueue(inf, "inf".into(), None);
+        h.enqueue(job(1), "next".into(), Some(1));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(Event::Progress { done: 2, .. }) = h.rx.recv_timeout(Duration::from_millis(200)) {
+                break;
+            }
+        }
+        drop(h); // UI gone (printer switched / app closed)
+        let log = wait_for(&log, "close");
+        assert_eq!(log.last().map(String::as_str), Some("close"), "worker exited: {log:?}");
+        assert_eq!(&log[log.len() - 3..], ["page-last", "finish", "close"], "last label fed + cut");
+        assert_eq!(log.iter().filter(|e| *e == "begin").count(), 1, "queued job not started");
+    }
+
+    #[test]
+    fn error_mid_job_fails_it_cleanly_and_queue_continues() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let on_page: OnPage = Box::new(|page| if page == 2 { Err(anyhow!("printer error: No tape")) } else { Ok(()) });
+        let mut h = spawn_mock(&log, Some(on_page));
+        let a = h.enqueue(job(3), "A".into(), Some(3));
+        let b = h.enqueue(job(1), "B".into(), Some(1));
+        let mut ev = vec![];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ev.len() < 4 && Instant::now() < deadline {
+            match h.rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Event::Started { id, .. }) => ev.push(format!("start{id}")),
+                Ok(Event::Done { id, printed }) => ev.push(format!("done{id}x{printed}")),
+                Ok(Event::Failed { id, error }) => ev.push(format!("failed{id}: {error}")),
+                _ => {}
+            }
+        }
+        assert_eq!(ev, [format!("start{a}"), format!("failed{a}: label 2: printer error: No tape"), format!("start{b}"), format!("done{b}x1")]);
+        assert_eq!(*log.lock().unwrap(), ["begin", "page", "abort", "begin", "page-last", "finish"]);
+    }
+
+    #[test]
+    fn stop_while_rendering_makes_that_label_the_last() {
+        use crate::label::{Block, TextBlock};
+        let renderer = Arc::new(Mutex::new(Renderer::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (r, s) = (renderer.clone(), stop.clone());
+        let log = Arc::new(Mutex::new(vec![]));
+        let on_page: OnPage = Box::new(move |page| {
+            if page == 1 {
+                // Hold the renderer so label 2 is mid-render when Stop is pressed.
+                let (tx, rx) = crossbeam_channel::bounded(0);
+                let (r, s) = (r.clone(), s.clone());
+                std::thread::spawn(move || {
+                    let _g = r.lock().unwrap();
+                    tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(100));
+                    s.store(true, Ordering::SeqCst);
+                });
+                rx.recv().unwrap();
+            }
+            Ok(())
+        });
+        let mut t = Mock { cover_polls: Arc::new(Mutex::new(0)), log: log.clone(), on_page: Some(on_page), pages: 0 };
+        let mut j = job(1);
+        j.settings.infinite = true;
+        j.label.blocks = vec![Block::Text(TextBlock { text: "#{n}".into(), ..Default::default() })];
+        let n = run_job(&mut t, &renderer, &j, &stop, &mut |_, _| {}).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(*log.lock().unwrap(), ["begin", "page", "page-last", "finish"]);
+    }
+
+    #[test]
+    fn unchanged_status_does_not_wake_the_ui() {
+        use std::sync::atomic::AtomicUsize;
+        let cover = Arc::new(Mutex::new(3));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let id = PrinterId { model: "PT-E550W".into(), link: Link::Network("mock".into()) };
+        let mock = Box::new(Mock { cover_polls: cover.clone(), log: Arc::new(Mutex::new(vec![])), on_page: None, pages: 0 });
+        let w = wakes.clone();
+        let notify = Arc::new(move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        });
+        let h = PrinterHandle::spawn_with(id, mock, Arc::new(Mutex::new(Renderer::new())), notify);
+        // 3 identical cover-open polls, then ready: one event (and one wake) per change.
+        let mut seen = vec![];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.last() != Some(&false) && Instant::now() < deadline {
+            if let Ok(Event::Status(s)) = h.rx.recv_timeout(Duration::from_millis(200)) {
+                seen.push(!s.errors().is_empty());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200)); // ~20 more identical polls
+        assert!(h.rx.try_iter().next().is_none(), "unchanged polls send nothing");
+        assert_eq!(seen, vec![true, false]);
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
     }
 }

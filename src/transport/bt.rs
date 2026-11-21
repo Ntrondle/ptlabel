@@ -33,13 +33,21 @@ impl BtTransport {
     }
 
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // No-progress timeout: a long page over slow SPP may take longer than 30 s in total.
+        let mut deadline = Instant::now() + Duration::from_secs(30);
         let mut off = 0;
         while off < data.len() {
             let end = (off + 1024).min(data.len());
             let r = self.port()?.write(&data[off..end]);
             match r {
-                Ok(n) => off += n,
+                Ok(0) => {
+                    self.port = None;
+                    bail!("Bluetooth write failed: link closed");
+                }
+                Ok(n) => {
+                    off += n;
+                    deadline = Instant::now() + Duration::from_secs(30);
+                }
                 Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
                     if Instant::now() > deadline {
                         self.port = None;
@@ -74,7 +82,11 @@ impl BtTransport {
             let mut tmp = [0u8; 64];
             let r = self.port()?.read(&mut tmp);
             match r {
-                Ok(0) => {}
+                // Raw tty (VMIN=1): read() only returns 0 at end of file, i.e. the link hung up.
+                Ok(0) => {
+                    self.port = None;
+                    bail!("Bluetooth link closed");
+                }
                 Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
                 Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::WouldBlock) => {}
                 Err(e) => {
@@ -94,6 +106,10 @@ impl BtTransport {
     fn request_status(&mut self) -> Result<Status> {
         self.write_all(&status::REQUEST)?;
         match self.read_frame(Duration::from_secs(4))? {
+            Some(s) if s.status_type() == ST_TURNED_OFF => {
+                self.port = None;
+                bail!("printer turned off")
+            }
             Some(s) => Ok(s),
             None => {
                 self.port = None; // force reconnect next time
@@ -125,7 +141,10 @@ impl Transport for BtTransport {
             match s.status_type() {
                 ST_COMPLETED => return Ok(()),
                 ST_ERROR => bail!("printer error: {}", s.summary()),
-                ST_TURNED_OFF => bail!("printer turned off"),
+                ST_TURNED_OFF => {
+                    self.port = None; // the link is gone; reopen on the next call
+                    bail!("printer turned off")
+                }
                 _ => {}
             }
         }
@@ -147,5 +166,143 @@ impl Transport for BtTransport {
 
     fn poll_interval(&self) -> Duration {
         Duration::from_secs(3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serialport::{ClearBuffer, DataBits, FlowControl, Parity, StopBits};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// Scripted serial port: `rx` chunks are returned by successive reads (empty → timeout);
+    /// each status request written moves the next `replies` entry into `rx`.
+    #[derive(Default)]
+    struct Mock {
+        rx: VecDeque<Vec<u8>>,
+        replies: VecDeque<Vec<Vec<u8>>>,
+        tx: Arc<Mutex<Vec<u8>>>,
+        eof: bool,
+        write_zero: bool,
+    }
+
+    impl Read for Mock {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            if self.eof {
+                return Ok(0);
+            }
+            let Some(mut c) = self.rx.pop_front() else {
+                std::thread::sleep(Duration::from_millis(2));
+                return Err(ErrorKind::TimedOut.into());
+            };
+            let n = c.len().min(b.len());
+            b[..n].copy_from_slice(&c[..n]);
+            if n < c.len() {
+                self.rx.push_front(c.split_off(n));
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for Mock {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.write_zero {
+                return Ok(0);
+            }
+            self.tx.lock().unwrap().extend_from_slice(b);
+            if b.ends_with(&status::REQUEST) {
+                self.rx.extend(self.replies.pop_front().unwrap_or_default());
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[rustfmt::skip]
+    impl SerialPort for Mock {
+        fn name(&self) -> Option<String> { None }
+        fn baud_rate(&self) -> serialport::Result<u32> { unimplemented!() }
+        fn data_bits(&self) -> serialport::Result<DataBits> { unimplemented!() }
+        fn flow_control(&self) -> serialport::Result<FlowControl> { unimplemented!() }
+        fn parity(&self) -> serialport::Result<Parity> { unimplemented!() }
+        fn stop_bits(&self) -> serialport::Result<StopBits> { unimplemented!() }
+        fn timeout(&self) -> Duration { Duration::from_millis(100) }
+        fn set_baud_rate(&mut self, _: u32) -> serialport::Result<()> { unimplemented!() }
+        fn set_data_bits(&mut self, _: DataBits) -> serialport::Result<()> { unimplemented!() }
+        fn set_flow_control(&mut self, _: FlowControl) -> serialport::Result<()> { unimplemented!() }
+        fn set_parity(&mut self, _: Parity) -> serialport::Result<()> { unimplemented!() }
+        fn set_stop_bits(&mut self, _: StopBits) -> serialport::Result<()> { unimplemented!() }
+        fn set_timeout(&mut self, _: Duration) -> serialport::Result<()> { unimplemented!() }
+        fn write_request_to_send(&mut self, _: bool) -> serialport::Result<()> { unimplemented!() }
+        fn write_data_terminal_ready(&mut self, _: bool) -> serialport::Result<()> { unimplemented!() }
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> { unimplemented!() }
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> { unimplemented!() }
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> { unimplemented!() }
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> { unimplemented!() }
+        fn bytes_to_read(&self) -> serialport::Result<u32> { unimplemented!() }
+        fn bytes_to_write(&self) -> serialport::Result<u32> { unimplemented!() }
+        fn clear(&self, _: ClearBuffer) -> serialport::Result<()> { unimplemented!() }
+        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> { unimplemented!() }
+        fn set_break(&self) -> serialport::Result<()> { unimplemented!() }
+        fn clear_break(&self) -> serialport::Result<()> { unimplemented!() }
+    }
+
+    fn frame(width: u8, status_type: u8) -> Vec<u8> {
+        let mut b = vec![0u8; 32];
+        b[..5].copy_from_slice(&[0x80, 0x20, 0x42, 0x30, 0x71]);
+        b[10] = width;
+        b[11] = 0x01;
+        b[18] = status_type;
+        b
+    }
+
+    /// The path doesn't exist, so a reconnect attempt fails without touching any device.
+    fn transport(m: Mock) -> BtTransport {
+        let mut t = BtTransport::new("/nonexistent/cu.PT-test".into());
+        t.port = Some(Box::new(m));
+        t
+    }
+
+    #[test]
+    fn status_drops_stale_frame_and_reassembles_split_reply() {
+        let reply = frame(12, 0x00);
+        let m = Mock {
+            rx: VecDeque::from([frame(6, 0x06)]),
+            replies: VecDeque::from([vec![reply[..10].to_vec(), reply[10..].to_vec()]]),
+            ..Default::default()
+        };
+        let tx = m.tx.clone();
+        let mut t = transport(m);
+        assert_eq!(t.status().unwrap().width(), 12);
+        assert_eq!(*tx.lock().unwrap(), status::REQUEST);
+        assert!(t.port.is_some());
+    }
+
+    #[test]
+    fn turned_off_drops_port() {
+        let m = Mock { replies: VecDeque::from([vec![frame(12, ST_TURNED_OFF)]]), ..Default::default() };
+        let mut t = transport(m);
+        assert!(t.status().is_err());
+        assert!(t.port.is_none());
+
+        let m = Mock { rx: VecDeque::from([frame(12, 0x06), frame(12, ST_TURNED_OFF)]), ..Default::default() };
+        let mut t = transport(m);
+        assert!(t.send_page(&[0x1A], 10.0).is_err());
+        assert!(t.port.is_none());
+    }
+
+    #[test]
+    fn hung_up_link_fails_fast() {
+        let start = Instant::now();
+        let mut t = transport(Mock { eof: true, ..Default::default() });
+        assert!(format!("{:#}", t.status().unwrap_err()).contains("closed"));
+        assert!(t.port.is_none());
+        let mut t = transport(Mock { write_zero: true, ..Default::default() });
+        assert!(t.status().is_err());
+        assert!(t.port.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

@@ -4,6 +4,7 @@
 use super::{Link, PrinterId};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 const KNOWN: [&str; 7] =
@@ -24,6 +25,12 @@ pub fn model_from_name(name: &str) -> String {
                 .collect()
         })
         .unwrap_or_else(|| name.into())
+}
+
+/// Deterministic choice among a service's IPv4 addresses (mdns-sd hands them over in a
+/// HashSet): routable before link-local 169.254/16, then the lowest.
+fn pick_v4(addrs: impl IntoIterator<Item = Ipv4Addr>) -> Option<Ipv4Addr> {
+    addrs.into_iter().min_by_key(|ip| (ip.is_link_local(), *ip))
 }
 
 /// Paired P-touch SPP devices, e.g. /dev/cu.PT-P710BT6431.
@@ -58,7 +65,10 @@ pub fn spawn(on_change: impl Fn(Vec<PrinterId>) + Send + 'static) {
             let mut next_scan = Instant::now();
             loop {
                 if let Some(rx) = &rx {
-                    while let Ok(ev) = rx.recv_timeout(Duration::from_millis(500)) {
+                    // Bounded window: a steady event stream can't starve the /dev scan, and a
+                    // disconnected channel (daemon gone) can't turn this into a busy loop.
+                    let until = Instant::now() + Duration::from_millis(500);
+                    while let Ok(ev) = rx.recv_deadline(until) {
                         match ev {
                             ServiceEvent::ServiceResolved(info) => {
                                 let full = info.get_fullname().to_string();
@@ -66,7 +76,7 @@ pub fn spawn(on_change: impl Fn(Vec<PrinterId>) + Send + 'static) {
                                 if !inst.to_ascii_uppercase().contains("PT-") {
                                     continue;
                                 }
-                                if let Some(ip) = info.get_addresses_v4().into_iter().next() {
+                                if let Some(ip) = pick_v4(info.get_addresses_v4()) {
                                     net.insert(
                                         full,
                                         PrinterId {
@@ -82,6 +92,7 @@ pub fn spawn(on_change: impl Fn(Vec<PrinterId>) + Send + 'static) {
                             _ => {}
                         }
                     }
+                    std::thread::sleep(until.saturating_duration_since(Instant::now()));
                 } else {
                     std::thread::sleep(Duration::from_millis(500));
                 }
@@ -112,5 +123,16 @@ mod tests {
         assert_eq!(model_from_name("PT-P710BT6431"), "PT-P710BT");
         assert_eq!(model_from_name("Brother PT-E550W"), "PT-E550W");
         assert_eq!(model_from_name("PT-D610BT-abc"), "PT-D610BT-ABC");
+    }
+
+    #[test]
+    fn picks_stable_routable_v4() {
+        let a: Ipv4Addr = "192.168.1.160".parse().unwrap();
+        let b: Ipv4Addr = "10.0.0.7".parse().unwrap();
+        let ll: Ipv4Addr = "169.254.3.4".parse().unwrap();
+        assert_eq!(pick_v4([ll, a, b]), Some(b));
+        assert_eq!(pick_v4([a, ll]), Some(a));
+        assert_eq!(pick_v4([ll]), Some(ll));
+        assert_eq!(pick_v4(Vec::<Ipv4Addr>::new()), None);
     }
 }

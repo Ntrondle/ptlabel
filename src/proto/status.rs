@@ -170,4 +170,71 @@ mod tests {
         let s = Status::parse(&b).unwrap();
         assert_eq!(s.errors(), vec!["No tape", "Cover open"]);
     }
+
+    #[test]
+    fn short_or_bad_frames_do_not_panic() {
+        assert!(Status::parse(&[]).is_err());
+        assert!(Status::parse(&E550W[..31]).is_err());
+        let mut b = E550W;
+        b[2] = 0x43;
+        assert!(Status::parse(&b).is_err());
+        assert!(Status::find(&[]).is_none());
+        assert!(Status::find(&[0x80, 0x20]).is_none());
+        assert!(Status::find(&E550W[..20]).is_none()); // partial frame: wait for more bytes
+        let mut long = E550W.to_vec();
+        long.extend_from_slice(&[0xAA; 8]);
+        assert_eq!(Status::parse(&long).unwrap().raw, E550W);
+    }
+
+    #[test]
+    fn every_error_bit() {
+        let mut b = E550W;
+        b[8] = 0xFF; // unused bits 1, 4, 5, 7 must be ignored
+        b[9] = 0xFF; // unused bits 1-3, 6, 7
+        let s = Status::parse(&b).unwrap();
+        assert_eq!(
+            s.errors(),
+            vec!["No tape", "Cutter jam", "Weak batteries", "Wrong AC adapter", "Wrong tape for this job", "Cover open", "Overheated"]
+        );
+        b[8] = 0xB2;
+        b[9] = 0xCE;
+        assert!(Status::parse(&b).unwrap().errors().is_empty());
+    }
+
+    #[test]
+    fn media_types_and_phase() {
+        use crate::proto::media::MediaKind;
+        let mut b = E550W;
+        b[11] = 0xFF;
+        let s = Status::parse(&b).unwrap();
+        assert!(s.tape().is_none());
+        assert_eq!(s.errors(), vec!["Incompatible tape"]);
+
+        b[11] = 0x00;
+        b[10] = 0x00;
+        let s = Status::parse(&b).unwrap();
+        assert!(s.tape().is_none());
+        assert_eq!(s.summary(), "No tape");
+
+        let mut b = E550W;
+        b[10] = 9;
+        b[11] = 0x17;
+        b[24] = 0x70;
+        let t = Status::parse(&b).unwrap().tape().unwrap();
+        assert_eq!((t.kind, t.print_pins, t.width_code), (MediaKind::HeatShrink31, 44, 9));
+        assert_eq!(t.describe(), "9 mm heat-shrink 3:1 · black on white heat-shrink");
+
+        let mut b = E550W;
+        b[18] = ST_COMPLETED;
+        b[19] = 0x01;
+        let s = Status::parse(&b).unwrap();
+        assert_eq!(s.status_type(), ST_COMPLETED);
+        assert!(s.is_printing());
+        assert_eq!(s.summary(), "Printing");
+        assert_eq!(s.model_name(), Some("PT-E550W"));
+        b[4] = 0x68;
+        assert_eq!(Status::parse(&b).unwrap().model_name(), Some("PT-P750W"));
+        b[4] = 0x00;
+        assert_eq!(Status::parse(&b).unwrap().model_name(), None);
+    }
 }
