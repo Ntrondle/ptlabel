@@ -32,6 +32,16 @@ impl BtTransport {
         Ok(self.port.as_mut().unwrap())
     }
 
+    /// Close the port without blocking. close() on a tty waits until its queued output is sent,
+    /// which never happens once the RFCOMM link has stalled: the printer thread hung there for
+    /// good and never reconnected. Discard what is queued, and close on a thread of its own.
+    fn drop_port(&mut self) {
+        if let Some(p) = self.port.take() {
+            let _ = p.clear(serialport::ClearBuffer::All);
+            std::thread::spawn(move || drop(p));
+        }
+    }
+
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
         // No-progress timeout: a long page over slow SPP may take longer than 30 s in total.
         let mut deadline = Instant::now() + Duration::from_secs(30);
@@ -41,7 +51,7 @@ impl BtTransport {
             let r = self.port()?.write(&data[off..end]);
             match r {
                 Ok(0) => {
-                    self.port = None;
+                    self.drop_port();
                     bail!("Bluetooth write failed: link closed");
                 }
                 Ok(n) => {
@@ -50,21 +60,18 @@ impl BtTransport {
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
                     if Instant::now() > deadline {
-                        self.port = None;
+                        self.drop_port();
                         bail!("Bluetooth write timed out");
                     }
                 }
                 Err(e) => {
-                    self.port = None;
+                    self.drop_port();
                     return Err(anyhow!(e).context("Bluetooth write failed"));
                 }
             }
         }
-        let r = self.port()?.flush();
-        if let Err(e) = r {
-            self.port = None;
-            return Err(anyhow!(e).context("Bluetooth flush failed"));
-        }
+        // No flush(): serialport's is tcdrain(), which blocks without a timeout on a stalled link.
+        // The status reads that follow have their own deadlines.
         Ok(())
     }
 
@@ -84,13 +91,13 @@ impl BtTransport {
             match r {
                 // Raw tty (VMIN=1): read() only returns 0 at end of file, i.e. the link hung up.
                 Ok(0) => {
-                    self.port = None;
+                    self.drop_port();
                     bail!("Bluetooth link closed");
                 }
                 Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
                 Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::WouldBlock) => {}
                 Err(e) => {
-                    self.port = None;
+                    self.drop_port();
                     return Err(anyhow!(e).context("Bluetooth read failed"));
                 }
             }
@@ -107,12 +114,12 @@ impl BtTransport {
         self.write_all(&status::REQUEST)?;
         match self.read_frame(Duration::from_secs(4))? {
             Some(s) if s.status_type() == ST_TURNED_OFF => {
-                self.port = None;
+                self.drop_port();
                 bail!("printer turned off")
             }
             Some(s) => Ok(s),
             None => {
-                self.port = None; // force reconnect next time
+                self.drop_port(); // force reconnect next time
                 bail!("no status reply over Bluetooth")
             }
         }
@@ -142,7 +149,7 @@ impl Transport for BtTransport {
                 ST_COMPLETED => return Ok(()),
                 ST_ERROR => bail!("printer error: {}", s.summary()),
                 ST_TURNED_OFF => {
-                    self.port = None; // the link is gone; reopen on the next call
+                    self.drop_port(); // the link is gone; reopen on the next call
                     bail!("printer turned off")
                 }
                 _ => {}
@@ -161,11 +168,17 @@ impl Transport for BtTransport {
     }
 
     fn close(&mut self) {
-        self.port = None;
+        self.drop_port();
     }
 
     fn poll_interval(&self) -> Duration {
         Duration::from_secs(3)
+    }
+}
+
+impl Drop for BtTransport {
+    fn drop(&mut self) {
+        self.drop_port();
     }
 }
 
@@ -185,6 +198,20 @@ mod tests {
         tx: Arc<Mutex<Vec<u8>>>,
         eof: bool,
         write_zero: bool,
+        _stuck_close: StuckClose,
+    }
+
+    /// When set, dropping the port takes 30 s, like close() on a tty draining into a stalled
+    /// RFCOMM link (that one never returns).
+    #[derive(Default)]
+    struct StuckClose(bool);
+
+    impl Drop for StuckClose {
+        fn drop(&mut self) {
+            if self.0 {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
     }
 
     impl Read for Mock {
@@ -244,7 +271,7 @@ mod tests {
         fn read_carrier_detect(&mut self) -> serialport::Result<bool> { unimplemented!() }
         fn bytes_to_read(&self) -> serialport::Result<u32> { unimplemented!() }
         fn bytes_to_write(&self) -> serialport::Result<u32> { unimplemented!() }
-        fn clear(&self, _: ClearBuffer) -> serialport::Result<()> { unimplemented!() }
+        fn clear(&self, _: ClearBuffer) -> serialport::Result<()> { Ok(()) }
         fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> { unimplemented!() }
         fn set_break(&self) -> serialport::Result<()> { unimplemented!() }
         fn clear_break(&self) -> serialport::Result<()> { unimplemented!() }
@@ -304,5 +331,15 @@ mod tests {
         assert!(t.status().is_err());
         assert!(t.port.is_none());
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stuck_close_does_not_block_the_worker() {
+        let start = Instant::now();
+        let mut t = transport(Mock { eof: true, _stuck_close: StuckClose(true), ..Default::default() });
+        assert!(t.status().is_err());
+        assert!(t.port.is_none());
+        drop(t);
+        assert!(start.elapsed() < Duration::from_secs(2), "closing the port blocked");
     }
 }
