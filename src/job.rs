@@ -38,7 +38,7 @@ pub struct Pager {
     copies: u32,
     start: i64,
     step: i64,
-    seq: Option<SequenceBlock>,
+    seqs: Vec<SequenceBlock>,
     rows: Vec<Arc<Record>>,
     pub total: Option<u32>,
 }
@@ -46,7 +46,14 @@ pub struct Pager {
 impl Pager {
     pub fn new(label: &Label, s: &PrintSettings, rows: Vec<Arc<Record>>) -> Self {
         let total = Self::counts(label, s, rows.len()).1;
-        Self { copies: s.copies.max(1), start: s.num_start, step: s.num_step, seq: label.sequence().cloned(), rows, total }
+        Self {
+            copies: s.copies.max(1),
+            start: s.num_start,
+            step: s.num_step,
+            seqs: label.sequences().cloned().collect(),
+            rows,
+            total,
+        }
     }
 
     /// (distinct labels, total labels) for `rows` selected spreadsheet rows; None = until stopped.
@@ -66,27 +73,29 @@ impl Pager {
         (records, records.map(|r| r.saturating_mul(s.copies.max(1))))
     }
 
-    /// Values for page `i` (copies of one record are consecutive pages).
-    pub fn vars(&self, i: u32) -> Vars {
-        let mut v = self.record_vars((i / self.copies) as u64);
-        v.n = self.start.saturating_add((i as i64).saturating_mul(self.step));
-        if let Some(q) = &self.seq {
+    fn build_vars(&self, index: u64, n: i64) -> Vars {
+        let row = (!self.rows.is_empty()).then(|| self.rows[index as usize % self.rows.len()].clone());
+        let mut v = Vars { n, index, seqs: Vec::with_capacity(self.seqs.len()), row };
+        for q in &self.seqs {
             // `{n}` in the prefix/suffix follows the copy, as on the rendered sequence block.
-            v.seq = q.format(v.index, &v);
+            let val = q.format(index, &v);
+            v.seqs.push(val);
         }
         v
     }
 
+    /// Values for page `i` (copies of one record are consecutive pages).
+    pub fn vars(&self, i: u32) -> Vars {
+        let index = (i / self.copies) as u64;
+        let n = self.start.saturating_add((i as i64).saturating_mul(self.step));
+        self.build_vars(index, n)
+    }
+
     /// Values for record `index` (its first copy).
     pub fn record_vars(&self, index: u64) -> Vars {
-        let row = (!self.rows.is_empty()).then(|| self.rows[index as usize % self.rows.len()].clone());
         let k = i64::try_from(index.saturating_mul(self.copies as u64)).unwrap_or(i64::MAX);
         let n = self.start.saturating_add(k.saturating_mul(self.step));
-        let mut v = Vars { n, index, seq: String::new(), row };
-        if let Some(q) = &self.seq {
-            v.seq = q.format(index, &v);
-        }
-        v
+        self.build_vars(index, n)
     }
 }
 
@@ -185,7 +194,10 @@ mod tests {
         let p = Pager::new(&label, &s, vec![]);
         assert_eq!(p.total, Some(6));
         assert_eq!(Pager::counts(&label, &s, 0), (Some(3), Some(6)));
-        assert_eq!([p.vars(0).seq, p.vars(1).seq, p.vars(2).seq, p.vars(5).seq], ["A-01", "A-01", "A-02", "A-03"]);
+        assert_eq!(
+            [p.vars(0).seqs[0].as_str(), p.vars(1).seqs[0].as_str(), p.vars(2).seqs[0].as_str(), p.vars(5).seqs[0].as_str()],
+            ["A-01", "A-01", "A-02", "A-03"]
+        );
         assert_eq!(p.vars(3).n, 25);
 
         // Selected rows drive the count; the sequence numbers them.
@@ -194,7 +206,7 @@ mod tests {
         let p = Pager::new(&label, &s, rows);
         assert_eq!(p.total, Some(4));
         let v = p.vars(2);
-        assert_eq!((v.row.as_ref().unwrap().get("Part"), v.seq.as_str()), (Some("C7"), "A-02"));
+        assert_eq!((v.row.as_ref().unwrap().get("Part"), v.seqs[0].as_str()), (Some("C7"), "A-02"));
 
         let inf = Pager::new(&label, &PrintSettings { infinite: true, ..Default::default() }, vec![]);
         assert_eq!(inf.total, None);
@@ -211,10 +223,28 @@ mod tests {
         // `{seq}` (QR/barcodes) must match what the sequence block itself renders for that page.
         for i in 0..4 {
             let v = p.vars(i);
-            assert_eq!(v.seq, label.sequence().unwrap().format(v.index, &v), "page {i}");
+            assert_eq!(v.seqs[0], label.sequence().unwrap().format(v.index, &v), "page {i}");
         }
-        assert_eq!([p.vars(0).seq, p.vars(1).seq, p.vars(2).seq], ["1/1", "1/2", "2/3"]);
-        assert_eq!(p.record_vars(1).seq, "2/3");
+        assert_eq!([p.vars(0).seqs[0].as_str(), p.vars(1).seqs[0].as_str(), p.vars(2).seqs[0].as_str()], ["1/1", "1/2", "2/3"]);
+        assert_eq!(p.record_vars(1).seqs[0], "2/3");
+    }
+
+    #[test]
+    fn pager_populates_multiple_sequences() {
+        use crate::label::{Block, SequenceBlock, expand};
+        let s = PrintSettings::default();
+        let label = Label {
+            blocks: vec![
+                Block::Sequence(SequenceBlock { prefix: "A-".into(), start: 1, step: 1, digits: 2, count: 3, ..Default::default() }),
+                Block::Sequence(SequenceBlock { prefix: "B-".into(), start: 10, step: 5, digits: 3, count: 4, ..Default::default() }),
+                Block::Sequence(SequenceBlock { prefix: "C-".into(), start: 100, step: -10, digits: 0, count: 2, ..Default::default() }),
+            ],
+            ..Default::default()
+        };
+        let p = Pager::new(&label, &s, vec![]);
+        assert_eq!(p.total, Some(4));
+        assert_eq!(expand("{seq} / {seq2} / {seq3}", &p.vars(0)), "A-01 / B-010 / C-100");
+        assert_eq!(expand("{seq} / {seq2} / {seq3}", &p.vars(2)), "A-03 / B-020 / C-80");
     }
 
     #[test]

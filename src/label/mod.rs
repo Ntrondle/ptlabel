@@ -280,7 +280,20 @@ impl Label {
         self.sequence().is_some() || self.blocks.iter().flat_map(|b| b.templates()).any(|t| t.contains('{'))
     }
     pub fn sequence(&self) -> Option<&SequenceBlock> {
-        self.blocks.iter().find_map(|b| if let Block::Sequence(q) = b { Some(q) } else { None })
+        self.sequences().next()
+    }
+    pub fn sequences(&self) -> impl Iterator<Item = &SequenceBlock> {
+        self.blocks.iter().filter_map(|b| if let Block::Sequence(q) = b { Some(q) } else { None })
+    }
+    /// True when a `Text` block references the `index`-th sequence (`{seq}` / `{seq1}` for 0,
+    /// `{seq2}` for 1, `{seq3}` for 2, …). In that case the sequence block doesn't render a
+    /// duplicate of itself on the label.
+    pub fn sequence_in_text(&self, index: usize) -> bool {
+        let ph = sequence_placeholder(index);
+        self.blocks.iter().any(|b| match b {
+            Block::Text(t) => t.text.contains(&ph) || (index == 0 && t.text.contains("{seq1}")),
+            _ => false,
+        })
     }
     pub fn uses(&self, key: &str) -> bool {
         // `{key}` or `{key:fmt}`, not `{keyword}`.
@@ -289,18 +302,23 @@ impl Label {
     }
 }
 
+/// Placeholder for the `index`-th sequence block: `{seq}`, `{seq2}`, `{seq3}`, …
+pub fn sequence_placeholder(index: usize) -> String {
+    if index == 0 { "{seq}".into() } else { format!("{{seq{}}}", index + 1) }
+}
+
 /// Per-label substitution values.
 #[derive(Clone, Debug, Default, PartialEq, Hash)]
 pub struct Vars {
     pub n: i64,
     /// Record index: which sequence value / spreadsheet row this label shows.
     pub index: u64,
-    /// The first sequence block's value, for `{seq}`.
-    pub seq: String,
+    /// Values of the label's sequence blocks in order (`{seq}` / `{seq1}`, `{seq2}`, `{seq3}`, …).
+    pub seqs: Vec<String>,
     pub row: Option<Arc<Record>>,
 }
 
-/// Expand `{n}`, `{n:03}`, `{seq}`, `{date}`, `{time}` and `{Column}` (spreadsheet);
+/// Expand `{n}`, `{n:03}`, `{seq}`, `{seq2}`, …, `{date}`, `{time}` and `{Column}` (spreadsheet);
 /// unknown keys stay verbatim.
 pub fn expand(s: &str, v: &Vars) -> String {
     if !s.contains('{') {
@@ -327,7 +345,18 @@ pub fn expand(s: &str, v: &Vars) -> String {
             "n" => Some(v.n.to_string()),
             "date" => Some(now.format("%Y-%m-%d").to_string()),
             "time" => Some(now.format("%H:%M").to_string()),
-            "seq" => Some(v.seq.clone()),
+            "seq" => Some(v.seqs.first().cloned().unwrap_or_default()),
+            k if k.starts_with("seq")
+                && k.len() > 3
+                && !k[3..].starts_with('0')
+                && k[3..].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                k[3..]
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|idx| v.seqs.get(idx - 1).cloned())
+                    .or_else(|| v.row.as_ref().and_then(|r| r.get(k)).map(String::from))
+            }
             // Width capped: i64 has at most 20 chars, and a typo must not allocate gigabytes.
             k if k.starts_with("n:") => k[2..]
                 .parse::<usize>()
@@ -367,10 +396,43 @@ mod tests {
     #[test]
     fn expands() {
         let row = Record { headers: Arc::new(vec!["Part".into(), "Bin".into()]), values: vec!["R1".into(), "A-12".into()] };
-        let v = Vars { n: 7, seq: "S-01".into(), row: Some(Arc::new(row)), ..Default::default() };
+        let v = Vars {
+            n: 7,
+            seqs: vec!["S-01".into(), "B-02".into(), "C-03".into()],
+            row: Some(Arc::new(row)),
+            ..Default::default()
+        };
         assert_eq!(expand("Box {n:03} / {bin} / {Part} {seq}", &v), "Box 007 / A-12 / R1 S-01");
+        assert_eq!(expand("{seq}|{seq1}|{seq2}|{seq3}|{seq4}|{seq0}", &v), "S-01|S-01|B-02|C-03|{seq4}|{seq0}");
         assert_eq!(expand("{n}{x}{", &v), "7{x}{");
         assert_eq!(expand("plain", &v), "plain");
+    }
+
+    #[test]
+    fn sequence_in_text_tracks_each_sequence() {
+        let label = Label {
+            blocks: vec![
+                Block::Text(TextBlock { text: "A {seq} C {seq3}".into(), ..Default::default() }),
+                Block::Qr(QrBlock { data: "{seq2}".into(), ..Default::default() }),
+                Block::Sequence(SequenceBlock::default()),
+                Block::Sequence(SequenceBlock::default()),
+                Block::Sequence(SequenceBlock::default()),
+            ],
+            ..Default::default()
+        };
+        assert!(label.sequence_in_text(0));
+        assert!(!label.sequence_in_text(1), "QR alone must not hide the sequence block");
+        assert!(label.sequence_in_text(2));
+
+        let alias = Label {
+            blocks: vec![Block::Text(TextBlock { text: "{seq1}".into(), ..Default::default() })],
+            ..Default::default()
+        };
+        assert!(alias.sequence_in_text(0));
+        assert!(!alias.sequence_in_text(1));
+        assert_eq!(sequence_placeholder(0), "{seq}");
+        assert_eq!(sequence_placeholder(1), "{seq2}");
+        assert_eq!(sequence_placeholder(2), "{seq3}");
     }
 
     #[test]

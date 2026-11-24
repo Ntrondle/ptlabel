@@ -1,6 +1,8 @@
 pub mod bt;
 pub mod discovery;
 pub mod net;
+#[cfg(target_os = "macos")]
+mod rfcomm;
 pub mod snmp;
 
 use crate::proto::{Caps, Status};

@@ -180,12 +180,21 @@ impl Renderer {
         let gap = mm_px(label.gap_mm, s);
 
         let mut parts: Vec<Canvas> = Vec::new();
+        let mut seq_idx = 0usize;
         for b in &label.blocks {
             let r = match b {
                 Block::Text(t) => Ok(self.text_block(t, &expand(&t.text, vars), inner_h, s)),
                 Block::Qr(q) => self.qr_block(q, &expand(&q.data, vars), inner_h, s),
                 Block::DataMatrix(d) => self.dm_block(d, &expand(&d.data, vars), inner_h, s),
-                Block::Sequence(q) => Ok(self.text_block(&q.style, &q.format(vars.index, vars), inner_h, s)),
+                Block::Sequence(q) => {
+                    let idx = seq_idx;
+                    seq_idx += 1;
+                    if label.sequence_in_text(idx) {
+                        continue;
+                    }
+                    let text = vars.seqs.get(idx).cloned().unwrap_or_else(|| q.format(vars.index, vars));
+                    Ok(self.text_block(&q.style, &text, inner_h, s))
+                }
                 Block::Barcode(bc) => self.barcode_block(bc, &expand(&bc.data, vars), inner_h, s),
                 Block::Image(i) => self.image_block(i, inner_h, s),
                 Block::Spacer { mm } => Ok(Canvas::new(mm_px(*mm, s), inner_h)),
@@ -1141,5 +1150,86 @@ mod tests {
         fresh.images.insert("mem:logo".into(), img(7));
         assert_eq!(b, fresh.render(&label, &tape, &Vars::default(), &o).bitmap);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sequence_hidden_when_used_in_text() {
+        use crate::job::{Pager, PrintSettings};
+        use crate::label::SequenceBlock;
+
+        let mut r = Renderer::new();
+        let tape = Tape::tze(18).unwrap();
+        let o = PageOpts::default();
+        let s = PrintSettings::default();
+
+        // Single sequence referenced in a non-bold Text block: renders identically to the Text block alone.
+        let non_bold = TextBlock { text: "{seq}".into(), size_pt: Some(8.0), bold: false, align: Align::Left, ..Default::default() };
+        let seq1 = SequenceBlock { prefix: "adar-".into(), start: 1, step: 1, digits: 3, count: 10, ..Default::default() };
+        let with_seq = Label {
+            blocks: vec![Block::Text(non_bold.clone()), Block::Sequence(seq1.clone())],
+            ..Default::default()
+        };
+        let plain_text = Label {
+            blocks: vec![Block::Text(TextBlock { text: "adar-001".into(), ..non_bold.clone() })],
+            ..Default::default()
+        };
+        let v = Pager::new(&with_seq, &s, vec![]).vars(0);
+        assert_eq!(
+            r.render(&with_seq, &tape, &v, &o).bitmap,
+            r.render(&plain_text, &tape, &Vars::default(), &o).bitmap
+        );
+
+        // Sequence referenced ONLY in a QR block still renders its own text next to the QR.
+        let seq_qr = Label {
+            blocks: vec![Block::Sequence(seq1.clone()), Block::Qr(QrBlock { data: "{seq}".into(), ..Default::default() })],
+            ..Default::default()
+        };
+        let qr_only = Label {
+            blocks: vec![Block::Qr(QrBlock { data: "adar-001".into(), ..Default::default() })],
+            ..Default::default()
+        };
+        let v_qr = Pager::new(&seq_qr, &s, vec![]).vars(0);
+        assert!(r.render(&seq_qr, &tape, &v_qr, &o).bitmap.w > r.render(&qr_only, &tape, &Vars::default(), &o).bitmap.w);
+
+        // Multiple sequences: only the ones referenced in Text are hidden; unspecified ones render as before.
+        let seq2 = SequenceBlock { prefix: "B-".into(), start: 10, step: 1, digits: 2, count: 5, ..Default::default() };
+        let partial = Label {
+            blocks: vec![
+                Block::Text(TextBlock { text: "{seq}".into(), ..non_bold.clone() }),
+                Block::Sequence(seq1.clone()),
+                Block::Sequence(seq2.clone()),
+            ],
+            ..Default::default()
+        };
+        let expected_partial = Label {
+            blocks: vec![
+                Block::Text(TextBlock { text: "adar-001".into(), ..non_bold.clone() }),
+                Block::Sequence(seq2.clone()),
+            ],
+            ..Default::default()
+        };
+        let vp = Pager::new(&partial, &s, vec![]).vars(0);
+        assert_eq!(
+            r.render(&partial, &tape, &vp, &o).bitmap,
+            r.render(&expected_partial, &tape, &Pager::new(&expected_partial, &s, vec![]).vars(0), &o).bitmap
+        );
+
+        let both = Label {
+            blocks: vec![
+                Block::Text(TextBlock { text: "{seq} / {seq2}".into(), ..non_bold.clone() }),
+                Block::Sequence(seq1),
+                Block::Sequence(seq2),
+            ],
+            ..Default::default()
+        };
+        let expected_both = Label {
+            blocks: vec![Block::Text(TextBlock { text: "adar-001 / B-10".into(), ..non_bold })],
+            ..Default::default()
+        };
+        let vb = Pager::new(&both, &s, vec![]).vars(0);
+        assert_eq!(
+            r.render(&both, &tape, &vb, &o).bitmap,
+            r.render(&expected_both, &tape, &Vars::default(), &o).bitmap
+        );
     }
 }

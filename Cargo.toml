@@ -1,6 +1,6 @@
 [package]
 name = "ptlabel"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 description = "Fast label app for Brother PT-P710BT (Bluetooth) and PT-E550W (Wi-Fi)"
 
@@ -16,7 +16,6 @@ datamatrix = "0.3"
 qrcode = { version = "0.15", default-features = false }
 barcoders = "2.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-serialport = { version = "4.10", default-features = false }
 mdns-sd = "0.22"
 rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +30,11 @@ ureq = { version = "3", default-features = false, features = ["native-tls", "jso
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSRange"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSpellChecker", "NSResponder", "NSApplication", "NSMenu", "NSMenuItem"] }
+# PT-P710BT: the RFCOMM channel is opened directly (src/transport/rfcomm.rs).
+objc2-io-bluetooth = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-foundation", "Bluetooth", "IOBluetoothDevice", "IOBluetoothObject", "IOBluetoothRFCOMMChannel", "IOBluetoothSDPServiceRecord", "IOBluetoothSDPUUID"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+serialport = { version = "4.10", default-features = false }
 
 [profile.release]
 # Small and still fast: size-optimised, thin LTO (fat makes the binary ~25% smaller but links

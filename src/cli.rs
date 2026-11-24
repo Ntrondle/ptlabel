@@ -1,8 +1,8 @@
 //! Scriptable CLI: list / status / render / print.
 
-use crate::job::{PrintJob, PrintSettings, run_job};
+use crate::job::{Pager, PrintJob, PrintSettings, run_job};
 use crate::label::render::{Renderer, label_length_mm, save_png};
-use crate::label::{Block, Label, Rotation, TextBlock, Vars};
+use crate::label::{Block, Label, Rotation, TextBlock};
 use crate::proto::Tape;
 use crate::transport::{PrinterId, discovery};
 use anyhow::{Context, Result, bail};
@@ -131,7 +131,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
             let t0 = std::time::Instant::now();
             let mut r = Renderer::new();
             let t1 = t0.elapsed();
-            let out = r.render(&label, &tape, &Vars { n: a.settings.num_start, ..Default::default() }, &a.settings.opts);
+            let vars = Pager::new(&label, &a.settings, vec![]).vars(0);
+            let out = r.render(&label, &tape, &vars, &a.settings.opts);
             let t2 = t0.elapsed() - t1;
             for w in &out.warnings {
                 eprintln!("warning: {w}");

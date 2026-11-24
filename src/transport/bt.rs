@@ -1,18 +1,40 @@
-//! PT-P710BT over Bluetooth Classic SPP. macOS exposes a paired SPP device as
-//! /dev/cu.<name>; opening it brings up the RFCOMM link.
+//! PT-P710BT over Bluetooth Classic SPP. On macOS the RFCOMM channel is opened directly
+//! (rfcomm.rs); elsewhere through the serial device of the paired printer.
 
 use super::Transport;
 use crate::proto::raster::{abort_sequence, job_header};
 use crate::proto::status::{self, ST_COMPLETED, ST_ERROR, ST_TURNED_OFF, Status};
-use anyhow::{Context, Result, anyhow, bail};
-use serialport::SerialPort;
+use anyhow::{Result, anyhow, bail};
 use std::io::{ErrorKind, Read, Write};
 use std::time::{Duration, Instant};
 
+/// The byte stream to the printer. Reads wait briefly and fail with TimedOut when nothing came;
+/// Ok(0) means the link is gone.
+trait Port: Read + Write + Send {}
+impl<T: Read + Write + Send> Port for T {}
+
 pub struct BtTransport {
+    /// /dev/cu.<name> of the paired printer, e.g. /dev/cu.PT-P710BT6431.
     path: String,
-    port: Option<Box<dyn SerialPort>>,
+    port: Option<Box<dyn Port>>,
     buf: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+fn connect(path: &str) -> Result<Box<dyn Port>> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = name.trim_start_matches("cu.").trim_start_matches("tty.");
+    Ok(Box::new(super::rfcomm::Rfcomm::open(name)?))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn connect(path: &str) -> Result<Box<dyn Port>> {
+    use anyhow::Context;
+    let p = serialport::new(path, 115_200)
+        .timeout(Duration::from_millis(100))
+        .open()
+        .with_context(|| format!("open {path} (is the printer on and paired?)"))?;
+    Ok(Box::new(p))
 }
 
 impl BtTransport {
@@ -20,26 +42,17 @@ impl BtTransport {
         Self { path, port: None, buf: Vec::new() }
     }
 
-    fn port(&mut self) -> Result<&mut Box<dyn SerialPort>> {
+    fn port(&mut self) -> Result<&mut Box<dyn Port>> {
         if self.port.is_none() {
-            let p = serialport::new(&self.path, 115_200)
-                .timeout(Duration::from_millis(100))
-                .open()
-                .with_context(|| format!("open {} (is the printer on and paired?)", self.path))?;
-            self.port = Some(p);
+            self.port = Some(connect(&self.path)?);
             self.buf.clear();
         }
         Ok(self.port.as_mut().unwrap())
     }
 
-    /// Close the port without blocking. close() on a tty waits until its queued output is sent,
-    /// which never happens once the RFCOMM link has stalled: the printer thread hung there for
-    /// good and never reconnected. Discard what is queued, and close on a thread of its own.
+    /// Close the link; the next call reconnects.
     fn drop_port(&mut self) {
-        if let Some(p) = self.port.take() {
-            let _ = p.clear(serialport::ClearBuffer::All);
-            std::thread::spawn(move || drop(p));
-        }
+        self.port = None;
     }
 
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
@@ -70,8 +83,6 @@ impl BtTransport {
                 }
             }
         }
-        // No flush(): serialport's is tcdrain(), which blocks without a timeout on a stalled link.
-        // The status reads that follow have their own deadlines.
         Ok(())
     }
 
@@ -120,14 +131,7 @@ impl BtTransport {
             Some(s) => Ok(s),
             None => {
                 self.drop_port(); // force reconnect next time
-                // Seen in bluetoothd's log: Connect in the macOS Bluetooth menu hands the printer's
-                // only SPP channel to BrailleService (macOS takes it for a braille display), which
-                // holds it for ~30-60 s. The port still opens, but nothing reaches the printer.
-                bail!(
-                    "no status reply over Bluetooth. Don't use Connect in the macOS Bluetooth menu: \
-                     macOS then holds the printer as a braille display for about a minute. \
-                     PTLabel connects by itself."
-                )
+                bail!("no status reply over Bluetooth")
             }
         }
     }
@@ -192,7 +196,6 @@ impl Drop for BtTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serialport::{ClearBuffer, DataBits, FlowControl, Parity, StopBits};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -205,20 +208,6 @@ mod tests {
         tx: Arc<Mutex<Vec<u8>>>,
         eof: bool,
         write_zero: bool,
-        _stuck_close: StuckClose,
-    }
-
-    /// When set, dropping the port takes 30 s, like close() on a tty draining into a stalled
-    /// RFCOMM link (that one never returns).
-    #[derive(Default)]
-    struct StuckClose(bool);
-
-    impl Drop for StuckClose {
-        fn drop(&mut self) {
-            if self.0 {
-                std::thread::sleep(Duration::from_secs(30));
-            }
-        }
     }
 
     impl Read for Mock {
@@ -255,35 +244,6 @@ mod tests {
         }
     }
 
-    #[rustfmt::skip]
-    impl SerialPort for Mock {
-        fn name(&self) -> Option<String> { None }
-        fn baud_rate(&self) -> serialport::Result<u32> { unimplemented!() }
-        fn data_bits(&self) -> serialport::Result<DataBits> { unimplemented!() }
-        fn flow_control(&self) -> serialport::Result<FlowControl> { unimplemented!() }
-        fn parity(&self) -> serialport::Result<Parity> { unimplemented!() }
-        fn stop_bits(&self) -> serialport::Result<StopBits> { unimplemented!() }
-        fn timeout(&self) -> Duration { Duration::from_millis(100) }
-        fn set_baud_rate(&mut self, _: u32) -> serialport::Result<()> { unimplemented!() }
-        fn set_data_bits(&mut self, _: DataBits) -> serialport::Result<()> { unimplemented!() }
-        fn set_flow_control(&mut self, _: FlowControl) -> serialport::Result<()> { unimplemented!() }
-        fn set_parity(&mut self, _: Parity) -> serialport::Result<()> { unimplemented!() }
-        fn set_stop_bits(&mut self, _: StopBits) -> serialport::Result<()> { unimplemented!() }
-        fn set_timeout(&mut self, _: Duration) -> serialport::Result<()> { unimplemented!() }
-        fn write_request_to_send(&mut self, _: bool) -> serialport::Result<()> { unimplemented!() }
-        fn write_data_terminal_ready(&mut self, _: bool) -> serialport::Result<()> { unimplemented!() }
-        fn read_clear_to_send(&mut self) -> serialport::Result<bool> { unimplemented!() }
-        fn read_data_set_ready(&mut self) -> serialport::Result<bool> { unimplemented!() }
-        fn read_ring_indicator(&mut self) -> serialport::Result<bool> { unimplemented!() }
-        fn read_carrier_detect(&mut self) -> serialport::Result<bool> { unimplemented!() }
-        fn bytes_to_read(&self) -> serialport::Result<u32> { unimplemented!() }
-        fn bytes_to_write(&self) -> serialport::Result<u32> { unimplemented!() }
-        fn clear(&self, _: ClearBuffer) -> serialport::Result<()> { Ok(()) }
-        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> { unimplemented!() }
-        fn set_break(&self) -> serialport::Result<()> { unimplemented!() }
-        fn clear_break(&self) -> serialport::Result<()> { unimplemented!() }
-    }
-
     fn frame(width: u8, status_type: u8) -> Vec<u8> {
         let mut b = vec![0u8; 32];
         b[..5].copy_from_slice(&[0x80, 0x20, 0x42, 0x30, 0x71]);
@@ -293,7 +253,7 @@ mod tests {
         b
     }
 
-    /// The path doesn't exist, so a reconnect attempt fails without touching any device.
+    /// No printer has this name, so a reconnect attempt would fail without touching any device.
     fn transport(m: Mock) -> BtTransport {
         let mut t = BtTransport::new("/nonexistent/cu.PT-test".into());
         t.port = Some(Box::new(m));
@@ -338,15 +298,5 @@ mod tests {
         assert!(t.status().is_err());
         assert!(t.port.is_none());
         assert!(start.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn stuck_close_does_not_block_the_worker() {
-        let start = Instant::now();
-        let mut t = transport(Mock { eof: true, _stuck_close: StuckClose(true), ..Default::default() });
-        assert!(t.status().is_err());
-        assert!(t.port.is_none());
-        drop(t);
-        assert!(start.elapsed() < Duration::from_secs(2), "closing the port blocked");
     }
 }

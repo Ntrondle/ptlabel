@@ -108,7 +108,7 @@ fn cases() -> Vec<(&'static str, Label, u8, PageOpts)> {
 
 fn vars() -> Vars {
     let row = Record { headers: Arc::new(vec!["Part".into()]), values: vec!["R1 10k".into()] };
-    Vars { n: 42, index: 3, seq: "BOX-004".into(), row: Some(Arc::new(row)) }
+    Vars { n: 42, index: 3, seqs: vec!["BOX-004".into()], row: Some(Arc::new(row)) }
 }
 
 fn h64(v: impl Hash) -> u64 {

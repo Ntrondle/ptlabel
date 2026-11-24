@@ -8,7 +8,7 @@ use crate::icons::{self, Icon};
 use crate::menu::MenuCmd;
 use crate::label::{
     Align, BarKind, BarcodeBlock, Block, DataMatrixBlock, DmShape, Ec, ImageBlock, Label, QrBlock, SequenceBlock,
-    TextBlock, Vars, expand,
+    TextBlock, Vars, expand, sequence_placeholder,
 };
 use crate::printer::{Event, PrinterHandle};
 use crate::proto::media::{self, TZE_WIDTHS};
@@ -111,6 +111,7 @@ fn job_title(label: &Label, v: &Vars) -> String {
     let cut = |s: &str, n: usize| {
         if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_string() }
     };
+    let mut seq_idx = 0usize;
     for b in &label.blocks {
         match b {
             Block::Text(t) => {
@@ -118,7 +119,15 @@ fn job_title(label: &Label, v: &Vars) -> String {
                     return cut(l, 26);
                 }
             }
-            Block::Sequence(q) => return cut(&q.format(v.index, v), 26),
+            Block::Sequence(q) => {
+                let idx = seq_idx;
+                seq_idx += 1;
+                if label.sequence_in_text(idx) {
+                    continue;
+                }
+                let text = v.seqs.get(idx).cloned().unwrap_or_else(|| q.format(v.index, v));
+                return cut(&text, 26);
+            }
             Block::Qr(q) if !q.data.is_empty() => return format!("QR {}", cut(&expand(&q.data, v), 22)),
             Block::DataMatrix(d) if !d.data.is_empty() => return format!("DM {}", cut(&expand(&d.data, v), 22)),
             Block::Barcode(b) if !b.data.is_empty() => return format!("Barcode {}", cut(&expand(&b.data, v), 18)),
@@ -1212,14 +1221,20 @@ impl App {
                 0 => ui.colored_label(Color32::from_rgb(230, 170, 30), "Select spreadsheet rows to print"),
                 n => ui.weak(format!("{n} row{}{times}", if n == 1 { "" } else { "s" })),
             };
-        } else if let Some(q) = self.p.label.sequence() {
+        } else if self.p.label.sequence().is_some() {
             let v = Vars::default();
-            let span = match records {
-                Some(1) => q.format(0, &v),
-                Some(n) => format!("{} → {}", q.format(0, &v), q.format(n as u64 - 1, &v)),
-                None => format!("{} → …", q.format(0, &v)),
-            };
-            ui.weak(format!("Sequence {span}{times}"));
+            let seqs: Vec<&SequenceBlock> = self.p.label.sequences().collect();
+            let multi_seq = seqs.len() > 1;
+            for (k, q) in seqs.iter().enumerate() {
+                let span = match records {
+                    Some(1) => q.format(0, &v),
+                    Some(n) => format!("{} → {}", q.format(0, &v), q.format(n as u64 - 1, &v)),
+                    None => format!("{} → …", q.format(0, &v)),
+                };
+                let name = if multi_seq { format!("Sequence {}", k + 1) } else { "Sequence".into() };
+                let suffix = if k == 0 { times.as_str() } else { "" };
+                ui.weak(format!("{name} {span}{suffix}"));
+            }
         }
 
         ui.separator();
@@ -1367,6 +1382,15 @@ impl App {
                 ui.add(DragValue::new(&mut l.length_mm).range(5.0..=1000.0).speed(0.2).fixed_decimals(1).suffix(" mm"));
                 align_buttons(ui, &mut l.align);
             }
+            ui.menu_button("Presets", |ui| {
+                for (name, mm) in LENGTH_PRESETS {
+                    if ui.button(format!("{name} · {mm:.0} mm")).clicked() {
+                        l.fixed_length = true;
+                        l.length_mm = mm;
+                        ui.close();
+                    }
+                }
+            });
             ui.separator();
             ui.label("Gap");
             ui.add(DragValue::new(&mut l.gap_mm).range(0.0..=50.0).speed(0.1).fixed_decimals(1).suffix(" mm"));
@@ -1391,14 +1415,30 @@ impl App {
         let target = &mut self.spell_target;
         let headers: Vec<String> = self.table.as_ref().map(|t| t.headers.to_vec()).unwrap_or_default();
         let rows_drive = self.p.label.data.is_some();
+        let seq_count = self.p.label.sequences().count();
+        let seq_in_text: Vec<bool> = (0..seq_count).map(|k| self.p.label.sequence_in_text(k)).collect();
+        let mut seq_idx = 0usize;
         let mut picked_image: Option<usize> = None;
         for i in 0..n {
             let b = &mut self.p.label.blocks[i];
+            let seq_info = if matches!(b, Block::Sequence(_)) {
+                let k = seq_idx;
+                seq_idx += 1;
+                Some((k, sequence_placeholder(k), seq_in_text[k]))
+            } else {
+                None
+            };
             egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     icons::show(ui, block_icon(b), 18.0);
-                    ui.label(RichText::new(b.kind_name()).strong());
+                    if let Some((k, ph, _)) = &seq_info {
+                        let title = if seq_count > 1 { format!("Sequence {}", k + 1) } else { "Sequence".into() };
+                        ui.label(RichText::new(title).strong());
+                        ui.label(RichText::new(ph).monospace().weak());
+                    } else {
+                        ui.label(RichText::new(b.kind_name()).strong());
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Remove").clicked() {
                             act = Some((i, Act::Del));
@@ -1416,7 +1456,10 @@ impl App {
                 });
                 match b {
                     Block::Text(t) => text_editor(ui, i, t, fonts, filter, speller, target, &headers),
-                    Block::Sequence(q) => sequence_editor(ui, i, q, fonts, filter, rows_drive),
+                    Block::Sequence(q) => {
+                        let (_, ph, in_text) = seq_info.as_ref().unwrap();
+                        sequence_editor(ui, i, q, fonts, filter, rows_drive, *in_text, ph);
+                    }
                     Block::Qr(q) => qr_editor(ui, i, q, &headers),
                     Block::DataMatrix(d) => dm_editor(ui, i, d, &headers),
                     Block::Barcode(bc) => barcode_editor(ui, i, bc, &headers),
@@ -1493,7 +1536,8 @@ impl App {
                 blocks.push(Block::Spacer { mm: 3.0 });
             }
         });
-        let mut hint = "Placeholders: {n}  {n:03}  {seq}  {date}  {time}".to_string();
+        let seq_hints = (0..seq_count.max(1)).map(sequence_placeholder).collect::<Vec<_>>().join("  ");
+        let mut hint = format!("Placeholders: {{n}}  {{n:03}}  {seq_hints}  {{date}}  {{time}}");
         if !headers.is_empty() {
             let cols: Vec<String> = headers.iter().take(8).map(|h| format!("{{{h}}}")).collect();
             hint += &format!("   ·   Columns: {}", cols.join("  "));
@@ -1611,6 +1655,16 @@ impl App {
         }
     }
 }
+
+/// Fixed lengths for lab containers, margins included. Tubes are labelled along their straight
+/// wall: laminated tape lifts when wrapped around a 10.8 mm tube.
+const LENGTH_PRESETS: [(&str, f32); 5] = [
+    ("Microscope slide, across the frosted end", 25.0),
+    ("1.5 ml tube, along the side", 25.0),
+    ("2 ml tube, along the side", 28.0),
+    ("15 ml Falcon, along the side", 50.0),
+    ("50 ml Falcon, along the side", 60.0),
+];
 
 fn align_buttons(ui: &mut egui::Ui, a: &mut Align) {
     ui.selectable_value(a, Align::Left, "Left");
@@ -1797,6 +1851,7 @@ fn style_row(ui: &mut egui::Ui, i: usize, t: &mut TextBlock, fonts: &[String], f
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sequence_editor(
     ui: &mut egui::Ui,
     i: usize,
@@ -1804,6 +1859,8 @@ fn sequence_editor(
     fonts: &[String],
     filter: &mut String,
     rows_drive: bool,
+    in_text: bool,
+    placeholder: &str,
 ) {
     ui.horizontal_wrapped(|ui| {
         ui.label("Prefix");
@@ -1828,8 +1885,12 @@ fn sequence_editor(
     } else {
         format!("{} → {}   ·   {} labels", q.format(0, &v), q.format(q.count as u64 - 1, &v), q.count)
     };
-    ui.weak(txt);
-    style_row(ui, i, &mut q.style, fonts, filter, &[]);
+    if in_text {
+        ui.weak(format!("{txt}   ·   shown via {placeholder}"));
+    } else {
+        ui.weak(txt);
+        style_row(ui, i, &mut q.style, fonts, filter, &[]);
+    }
 }
 
 /// Spreadsheet rows: click toggles, ⇧-click selects a range; virtualised for big sheets.
