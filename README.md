@@ -17,7 +17,7 @@ cargo test
 ## Connecting
 
 - **PT-E550W (Wi-Fi):** found automatically over Bonjour (`_pdl-datastream._tcp`), or type its IP in the top bar. Print data goes over raw TCP 9100. Status and tape detection come from SNMP, because the printer doesn't answer status requests on 9100.
-- **PT-P710BT (Bluetooth):** pair it once in System Settings › Bluetooth. macOS then creates `/dev/cu.PT-P710BT…`, which shows up in the printer menu.
+- **PT-P710BT (Bluetooth):** pair it once in System Settings › Bluetooth. macOS then creates `/dev/cu.PT-P710BT…`, which shows up in the printer menu. After that, don't click **Connect** on it in the Bluetooth menu: macOS treats its serial port as a braille display and keeps the printer's only channel for about a minute, so PTLabel gets no replies. Just turn the printer on; PTLabel connects by itself.
 
 ## Features
 

@@ -120,7 +120,14 @@ impl BtTransport {
             Some(s) => Ok(s),
             None => {
                 self.drop_port(); // force reconnect next time
-                bail!("no status reply over Bluetooth")
+                // Seen in bluetoothd's log: Connect in the macOS Bluetooth menu hands the printer's
+                // only SPP channel to BrailleService (macOS takes it for a braille display), which
+                // holds it for ~30-60 s. The port still opens, but nothing reaches the printer.
+                bail!(
+                    "no status reply over Bluetooth. Don't use Connect in the macOS Bluetooth menu: \
+                     macOS then holds the printer as a braille display for about a minute. \
+                     PTLabel connects by itself."
+                )
             }
         }
     }
