@@ -12,6 +12,8 @@ cargo run                       # dev
 cargo test
 ```
 
+**Updates:** the app checks the repo's latest GitHub release every 6 h (on launch, then 6-hourly). If it's newer, it shows an *Update available* dialog and an *Update to x.y.z…* link in the status bar. **Update now** downloads the DMG, verifies the signature, swaps the app in place and reopens it. A bare `cargo run` binary doesn't check. To release, publish a `vX.Y.Z` GitHub release matching `Cargo.toml`'s version; the workflow attaches the DMG.
+
 ## Connecting
 
 - **PT-E550W (Wi-Fi):** found automatically over Bonjour (`_pdl-datastream._tcp`), or type its IP in the top bar. Print data goes over raw TCP 9100. Status and tape detection come from SNMP, because the printer doesn't answer status requests on 9100.

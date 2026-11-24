@@ -226,7 +226,26 @@ pub struct App {
     data_checked: Instant,
     /// The label as last opened/saved (or new); differs from `p.label` = unsaved changes.
     saved: Label,
+    /// A newer release on GitHub ("Update to …" in the status bar), its modal, and install state.
+    update: Option<crate::update::Release>,
+    update_modal: bool,
+    updating: bool,
+    update_error: Option<String>,
+    /// The last look for a newer release; update checks and installs answer on `upd`.
+    checked: Option<Instant>,
+    upd: (crossbeam_channel::Sender<Upd>, crossbeam_channel::Receiver<Upd>),
 }
+
+enum Upd {
+    Found(crate::update::Release),
+    /// The new app is in place (its path), or why not.
+    Installed(Result<std::path::PathBuf, String>),
+}
+
+/// How often a running app looks for a new release.
+const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+const ACCENT: Color32 = Color32::from_rgb(58, 123, 234);
 
 fn rgb(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
@@ -282,6 +301,12 @@ impl App {
             last_click: None,
             data_checked: Instant::now(),
             saved: Label::default(),
+            update: None,
+            update_modal: false,
+            updating: false,
+            update_error: None,
+            checked: None,
+            upd: crossbeam_channel::unbounded(),
         };
         // Restored label vs. its file on disk (missing/unreadable file = unsaved).
         if let Some(l) = app.p.doc_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()) {
@@ -439,6 +464,132 @@ impl App {
                     self.error(format!("Print failed ({title}): {error}"));
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- updates
+
+    /// Look for a newer release now and then (only an app bundle can update itself).
+    fn check_update(&mut self, ctx: &egui::Context) {
+        if self.checked.is_some_and(|t| t.elapsed() < UPDATE_EVERY) || crate::update::bundle().is_none() {
+            return;
+        }
+        self.checked = Some(Instant::now());
+        // Idle frames don't come by themselves: wake up for the next check.
+        ctx.request_repaint_after(UPDATE_EVERY);
+        let (tx, ctx) = (self.upd.0.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            match crate::update::latest() {
+                Ok(Some(r)) => {
+                    let _ = tx.send(Upd::Found(r));
+                    ctx.request_repaint();
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("ptlabel: update check: {e:#}"),
+            }
+        });
+    }
+
+    fn start_update(&mut self, ctx: &egui::Context) {
+        let (Some(r), Some(app)) = (self.update.clone(), crate::update::bundle()) else { return };
+        self.updating = true;
+        let (tx, ctx) = (self.upd.0.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let res = crate::update::install(&r, &app).map(|()| app).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Upd::Installed(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn updates(&mut self, ctx: &egui::Context) {
+        let msgs: Vec<_> = self.upd.1.try_iter().collect();
+        for m in msgs {
+            match m {
+                Upd::Found(r) => {
+                    if self.update.as_ref().is_none_or(|u| u.version != r.version) {
+                        self.update_modal = true;
+                        self.update_error = None;
+                    }
+                    self.update = Some(r);
+                }
+                // In place: open the new one and quit this one (the label is kept in the saved state).
+                Upd::Installed(Ok(app)) => {
+                    crate::update::relaunch(&app);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Upd::Installed(Err(e)) => {
+                    self.updating = false;
+                    let msg = format!("Update failed: {e}");
+                    self.update_error = Some(msg.clone());
+                    self.error(msg);
+                }
+            }
+        }
+    }
+
+    /// A label printing or queued: quitting now would drop it.
+    fn printing(&self) -> bool {
+        self.job.is_some() || self.handle.as_ref().is_some_and(|h| !h.queued().is_empty())
+    }
+
+    fn update_dialog(&mut self, ctx: &egui::Context) {
+        let Some(r) = self.update.clone() else {
+            self.update_modal = false;
+            return;
+        };
+        let printing = self.printing();
+        let (mut close, mut install) = (false, false);
+        let style = ctx.global_style();
+        let frame = egui::Frame::new()
+            .fill(style.visuals.panel_fill)
+            .stroke(style.visuals.window_stroke)
+            .corner_radius(10)
+            .inner_margin(egui::Margin::same(24));
+        let resp = egui::Modal::new(egui::Id::unique("update")).frame(frame).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.label(RichText::new("Update available").strong().size(20.0));
+            ui.add_space(12.0);
+            ui.label(format!("PTLabel {} is ready to install.", r.version));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Installed").small().weak());
+                ui.label(RichText::new(env!("CARGO_PKG_VERSION")).small().monospace().weak());
+                ui.label(RichText::new("→").small().weak());
+                ui.label(RichText::new("New").small().weak());
+                ui.label(RichText::new(&r.version).small().monospace().strong().color(ACCENT));
+            });
+            ui.add_space(12.0);
+            if self.updating {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak("Downloading and installing…");
+                });
+            } else if printing {
+                ui.label(RichText::new("Printing: update once the queue is done.").small().color(Color32::from_rgb(230, 150, 20)));
+            } else {
+                ui.label(RichText::new("PTLabel will download the update, replace the app, and reopen automatically.").small().weak());
+            }
+            if let Some(e) = &self.update_error {
+                ui.add_space(8.0);
+                ui.label(RichText::new(e).small().color(Color32::from_rgb(220, 60, 50)));
+            }
+            ui.add_space(16.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.updating { "Updating…" } else { "Update now" };
+                let primary = egui::Button::new(RichText::new(label).color(Color32::WHITE).strong()).fill(ACCENT);
+                if ui.add_enabled(!self.updating && !printing, primary).clicked() {
+                    install = true;
+                }
+                if ui.add_enabled(!self.updating, egui::Button::new("Later")).clicked() {
+                    close = true;
+                }
+            });
+        });
+        if install {
+            self.update_error = None;
+            self.start_update(ctx);
+        } else if !self.updating && (close || resp.should_close()) {
+            self.update_modal = false;
         }
     }
 
@@ -1367,6 +1518,17 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak("⌘P print   ⌘S save   ⌘O open   ⌘N new");
+                if let Some(r) = &self.update {
+                    ui.separator();
+                    let t = if self.updating { "Updating…".to_string() } else { format!("Update to {}…", r.version) };
+                    let resp = ui
+                        .add(egui::Label::new(RichText::new(format!("● {t}")).color(ACCENT)).sense(egui::Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Installs it and opens PTLabel again");
+                    if resp.clicked() {
+                        self.update_modal = true;
+                    }
+                }
             });
         });
     }
@@ -1936,6 +2098,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.pump();
+        self.updates(&ctx);
+        self.check_update(&ctx);
         if self.handle.is_none() && self.p.auto_connect && self.p.printer.is_none() {
             let first = self.discovered.lock().unwrap().first().cloned();
             if let Some(id) = first {
@@ -1966,6 +2130,9 @@ impl eframe::App for App {
                 self.blocks_ui(ui);
             });
         });
+        if self.update_modal {
+            self.update_dialog(&ctx);
+        }
         self.update_title(&ctx);
     }
 
