@@ -13,7 +13,7 @@ use std::time::Duration;
 const USAGE: &str = "\
 ptlabel                         open the app
 ptlabel list                    find printers (Bluetooth + Wi-Fi)
-ptlabel status <target>         read status (target = IP/host or /dev/cu.PT-...)
+ptlabel status <target>         read status (target = IP/host, /dev/cu.PT-..., bt:PT-... or COM#)
 ptlabel render [opts] [text]    render to PNG (--out FILE, --tape MM)
 ptlabel print <target> [opts] [text]
 options: --label FILE.ptlabel  --copies N  --no-cut  --half-cut  --chain  --hires
@@ -104,6 +104,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
             std::thread::sleep(Duration::from_secs(4));
             let v = found.lock().unwrap();
             if v.is_empty() {
+                #[cfg(target_os = "windows")]
+                println!("no printers found (pair the PT-P710BT in Settings > Bluetooth & devices)");
+                #[cfg(not(target_os = "windows"))]
                 println!("no printers found (pair the PT-P710BT in System Settings > Bluetooth)");
             }
             for p in v.iter() {

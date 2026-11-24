@@ -22,12 +22,27 @@ pub struct BtTransport {
 
 #[cfg(target_os = "macos")]
 fn connect(path: &str) -> Result<Box<dyn Port>> {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = path.strip_prefix("bt:").unwrap_or(path);
+    let name = name.rsplit('/').next().unwrap_or(name);
     let name = name.trim_start_matches("cu.").trim_start_matches("tty.");
     Ok(Box::new(super::rfcomm::Rfcomm::open(name)?))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn connect(path: &str) -> Result<Box<dyn Port>> {
+    if super::is_com_port(path) {
+        use anyhow::Context;
+        let p = serialport::new(path, 115_200)
+            .timeout(Duration::from_millis(100))
+            .open()
+            .with_context(|| format!("open {path} (is the printer on and paired?)"))?;
+        return Ok(Box::new(p));
+    }
+    let name = path.strip_prefix("bt:").unwrap_or(path);
+    Ok(Box::new(super::bt_win::Rfcomm::open(name)?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn connect(path: &str) -> Result<Box<dyn Port>> {
     use anyhow::Context;
     let p = serialport::new(path, 115_200)

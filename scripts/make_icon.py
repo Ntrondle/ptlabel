@@ -93,7 +93,12 @@ def main():
     body = b"".join(entries)
     with open(os.path.join(ROOT, "assets", "PTLabel.icns"), "wb") as out:
         out.write(b"icns" + struct.pack(">I", 8 + len(body)) + body)
-    print("wrote assets/icon.png, assets/PTLabel.icns")
+    icon.save(
+        os.path.join(ROOT, "assets", "PTLabel.ico"),
+        format="ICO",
+        sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+    )
+    print("wrote assets/icon.png, assets/PTLabel.icns, assets/PTLabel.ico")
 
 
 if __name__ == "__main__":

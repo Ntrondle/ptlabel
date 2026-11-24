@@ -1,4 +1,6 @@
 pub mod bt;
+#[cfg(target_os = "windows")]
+mod bt_win;
 pub mod discovery;
 pub mod net;
 #[cfg(target_os = "macos")]
@@ -29,7 +31,7 @@ impl PrinterId {
             Link::Bluetooth(p) => format!(
                 "{} · Bluetooth ({})",
                 self.model,
-                p.trim_start_matches("/dev/cu.")
+                p.trim_start_matches("/dev/cu.").trim_start_matches("bt:")
             ),
             Link::Network(h) => format!("{} · Wi-Fi {h}", self.model),
         }
@@ -41,11 +43,15 @@ impl PrinterId {
         Caps { half_cut: full, cut_every: full }
     }
 
-    /// Parse a CLI target: /dev path, "bt", or a host.
+    /// Parse a CLI target: `/dev/...`, `bt:<name-or-MAC>`, Windows `COM<n>`, or a Wi-Fi host/IP.
     pub fn from_target(t: &str) -> Self {
         if t.starts_with("/dev/") {
             let name = t.trim_start_matches("/dev/cu.").trim_start_matches("/dev/tty.");
             Self { model: discovery::model_from_name(name), link: Link::Bluetooth(t.into()) }
+        } else if let Some(name) = t.strip_prefix("bt:").or_else(|| t.strip_prefix("BT:")) {
+            Self { model: discovery::model_from_name(name), link: Link::Bluetooth(format!("bt:{name}")) }
+        } else if is_com_port(t) {
+            Self { model: "PT-P710BT".into(), link: Link::Bluetooth(t.to_ascii_uppercase()) }
         } else {
             Self { model: "PT-E550W".into(), link: Link::Network(t.into()) }
         }
@@ -75,4 +81,37 @@ pub trait Transport: Send {
     fn close(&mut self) {}
     /// Idle poll interval.
     fn poll_interval(&self) -> std::time::Duration;
+}
+
+/// True for Windows COM ports such as `COM3`, `com12`, or `\\.\COM12`.
+pub(crate) fn is_com_port(s: &str) -> bool {
+    let rest = s.strip_prefix(r"\\.\").unwrap_or(s);
+    rest.len() >= 4
+        && rest[..3].eq_ignore_ascii_case("COM")
+        && rest[3..].bytes().all(|b| b.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_targets_for_macos_windows_and_wifi() {
+        let mac = PrinterId::from_target("/dev/cu.PT-P710BT9475");
+        assert_eq!(mac.link, Link::Bluetooth("/dev/cu.PT-P710BT9475".into()));
+        assert_eq!(mac.display(), "PT-P710BT · Bluetooth (PT-P710BT9475)");
+
+        let win = PrinterId::from_target("bt:PT-P710BT9475");
+        assert_eq!(win.link, Link::Bluetooth("bt:PT-P710BT9475".into()));
+        assert_eq!(win.display(), "PT-P710BT · Bluetooth (PT-P710BT9475)");
+
+        let com = PrinterId::from_target("com5");
+        assert_eq!(com.link, Link::Bluetooth("COM5".into()));
+        assert!(is_com_port(r"\\.\COM12"));
+        assert!(!is_com_port("com"));
+        assert!(!is_com_port("company.local"));
+
+        let net = PrinterId::from_target("192.168.1.160");
+        assert_eq!(net.link, Link::Network("192.168.1.160".into()));
+    }
 }

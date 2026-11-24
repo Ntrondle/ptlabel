@@ -8,9 +8,11 @@ same renderer and print code as the app. A preview rendered by the CLI is exactl
 The app binary is the CLI: run it with a command to use the CLI, with no arguments to open the app.
 
 ```sh
-PT=/Applications/PTLabel.app/Contents/MacOS/PTLabel   # installed from the DMG
-PT=~/Applications/PTLabel.app/Contents/MacOS/PTLabel  # scripts/bundle.sh --install
+PT=/Applications/PTLabel.app/Contents/MacOS/PTLabel   # macOS: installed from the DMG
+PT=~/Applications/PTLabel.app/Contents/MacOS/PTLabel  # macOS: scripts/bundle.sh --install
 PT=target/release/ptlabel                              # cargo build --release
+# Windows (PowerShell):
+$PT = ".\PTLabel.exe"                                  # standalone Windows build
 ```
 
 Bluetooth as described here needs PTLabel 2.1.2 or later: the CLI opens the printer's serial channel
@@ -30,7 +32,8 @@ Exit status: 0 on success, 1 on any error. The error is printed on stderr as `Er
 | `$PT --help` | Usage. |
 
 **Targets**
-- Bluetooth: `/dev/cu.<Bluetooth name>`, e.g. `/dev/cu.PT-P710BT9475`. Anything that starts with `/dev/` is taken as Bluetooth, and the part after `cu.` names the printer. The printer must be paired with this Mac once (System Settings › Bluetooth).
+- Bluetooth (macOS): `/dev/cu.<Bluetooth name>`, e.g. `/dev/cu.PT-P710BT9475`. Anything that starts with `/dev/` is taken as Bluetooth, and the part after `cu.` names the printer. The printer must be paired with this Mac once (System Settings › Bluetooth).
+- Bluetooth (Windows): `bt:<Bluetooth name>` (e.g. `bt:PT-P710BT9475`), `bt:<MAC>` (e.g. `bt:AA:BB:CC:DD:EE:FF`), or a COM port (`COM5`). The printer must be paired once in Settings › Bluetooth & devices.
 - Wi-Fi: an IP address or host name, e.g. `192.168.1.160`.
 
 `list` prints targets exactly as `status` and `print` take them:

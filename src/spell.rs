@@ -209,6 +209,7 @@ pub fn replace_chars(text: &mut String, start: usize, end: usize, with: &str) {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn flags_typos_not_placeholders() {
         let mut s = Speller::new();

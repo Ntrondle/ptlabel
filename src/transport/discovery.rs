@@ -33,7 +33,14 @@ fn pick_v4(addrs: impl IntoIterator<Item = Ipv4Addr>) -> Option<Ipv4Addr> {
     addrs.into_iter().min_by_key(|ip| (ip.is_link_local(), *ip))
 }
 
+/// Paired P-touch Bluetooth SPP printers.
+#[cfg(target_os = "windows")]
+pub fn scan_serial() -> Vec<PrinterId> {
+    super::bt_win::scan_paired()
+}
+
 /// Paired P-touch SPP devices, e.g. /dev/cu.PT-P710BT6431.
+#[cfg(not(target_os = "windows"))]
 pub fn scan_serial() -> Vec<PrinterId> {
     let Ok(rd) = std::fs::read_dir("/dev") else { return vec![] };
     let mut v: Vec<PrinterId> = rd
@@ -47,7 +54,7 @@ pub fn scan_serial() -> Vec<PrinterId> {
             })
         })
         .collect();
-    v.sort_by(|a, b| a.display().cmp(&b.display()));
+    v.sort_by_key(|a| a.display());
     v
 }
 

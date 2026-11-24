@@ -1090,6 +1090,9 @@ impl App {
                         });
                     }
                     if list.is_empty() {
+                        #[cfg(target_os = "windows")]
+                        ui.weak("Searching… pair the PT-P710BT in Settings › Bluetooth & devices");
+                        #[cfg(not(target_os = "windows"))]
                         ui.weak("Searching… pair the PT-P710BT in System Settings › Bluetooth");
                     }
                     ui.separator();
@@ -1281,7 +1284,11 @@ impl App {
             let col = ui.style().interact(&out.response).text_color();
             icons::paint(ui.painter(), r, Icon::Printer, col);
         }
-        if out.response.on_hover_text("⌘P · jobs queue up while printing").clicked() {
+        #[cfg(target_os = "macos")]
+        const PRINT_HINT: &str = "⌘P · jobs queue up while printing";
+        #[cfg(not(target_os = "macos"))]
+        const PRINT_HINT: &str = "Ctrl+P · jobs queue up while printing";
+        if out.response.on_hover_text(PRINT_HINT).clicked() {
             self.print();
         }
         if self.handle.is_none() {
@@ -1561,7 +1568,10 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                #[cfg(target_os = "macos")]
                 ui.weak("⌘P print   ⌘S save   ⌘O open   ⌘N new");
+                #[cfg(not(target_os = "macos"))]
+                ui.weak("Ctrl+P print   Ctrl+S save   Ctrl+O open   Ctrl+N new");
                 if let Some(r) = &self.update {
                     ui.separator();
                     let t = if self.updating { "Updating…".to_string() } else { format!("Update to {}…", r.version) };
@@ -1596,12 +1606,16 @@ impl App {
                 cmds.push(c);
             }
         }
-        // ⌘Z / ⇧⌘Z in a text field are its own undo (⇧ first: ⌘Z matches it too).
+        // ⌘Z / ⇧⌘Z (or Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y) in a text field are its own undo.
         if !ctx.text_edit_focused() {
             for (k, c) in [(sc(shift_cmd, Key::Z), MenuCmd::Redo), (sc(Modifiers::COMMAND, Key::Z), MenuCmd::Undo)] {
                 if ctx.input_mut(|i| i.consume_shortcut(&k)) {
                     cmds.push(c);
                 }
+            }
+            #[cfg(not(target_os = "macos"))]
+            if ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND, Key::Y))) {
+                cmds.push(MenuCmd::Redo);
             }
         }
         let mut seen = Vec::new();
@@ -1610,48 +1624,124 @@ impl App {
                 continue;
             }
             seen.push(c);
-            match c {
-                MenuCmd::Undo | MenuCmd::Redo if ctx.text_edit_focused() => {
-                    // The Edit menu took the key: give it back to the text field next frame.
-                    let shift = if c == MenuCmd::Redo { Modifiers::SHIFT } else { Modifiers::NONE };
-                    let modifiers = Modifiers::COMMAND | Modifiers::MAC_CMD | shift;
-                    for pressed in [true, false] {
-                        let (key, physical_key, repeat) = (Key::Z, Some(Key::Z), false);
-                        self.forward.push(egui::Event::Key { key, physical_key, pressed, repeat, modifiers });
-                    }
-                    ctx.request_repaint();
+            self.run_menu_cmd(ctx, c);
+        }
+    }
+
+    fn run_menu_cmd(&mut self, ctx: &egui::Context, c: MenuCmd) {
+        match c {
+            MenuCmd::Undo | MenuCmd::Redo if ctx.text_edit_focused() => {
+                // The Edit menu took the key: give it back to the text field next frame.
+                let shift = if c == MenuCmd::Redo { Modifiers::SHIFT } else { Modifiers::NONE };
+                let modifiers = Modifiers::COMMAND | Modifiers::MAC_CMD | shift;
+                for pressed in [true, false] {
+                    let (key, physical_key, repeat) = (Key::Z, Some(Key::Z), false);
+                    self.forward.push(egui::Event::Key { key, physical_key, pressed, repeat, modifiers });
                 }
-                MenuCmd::Undo => self.undo(true),
-                MenuCmd::Redo => self.undo(false),
-                MenuCmd::OpenRecent => {
-                    if let Some(p) = crate::menu::take_recent() {
-                        self.open_path(p.into());
-                    }
-                    self.refresh_recent();
-                }
-                MenuCmd::ClearRecent => {
-                    self.p.recent.clear();
-                    self.refresh_recent();
-                }
-                MenuCmd::New => {
-                    if !self.confirm_discard() {
-                        continue;
-                    }
-                    self.p.label = Label::default();
-                    self.saved = Label::default();
-                    self.p.doc_path = None;
-                    self.p.sel_rows.clear();
-                    self.preview_row = None;
-                    self.last_click = None;
-                    self.reload_table();
-                    self.history = History::new(self.p.label.clone());
-                }
-                MenuCmd::Open => self.open(),
-                MenuCmd::Save => self.save(false),
-                MenuCmd::SaveAs => self.save(true),
-                MenuCmd::ExportPng => self.export_png(),
-                MenuCmd::Print => self.print(),
+                ctx.request_repaint();
             }
+            MenuCmd::Undo => self.undo(true),
+            MenuCmd::Redo => self.undo(false),
+            MenuCmd::OpenRecent => {
+                if let Some(p) = crate::menu::take_recent() {
+                    self.open_path(p.into());
+                }
+                self.refresh_recent();
+            }
+            MenuCmd::ClearRecent => {
+                self.p.recent.clear();
+                self.refresh_recent();
+            }
+            MenuCmd::New => {
+                if !self.confirm_discard() {
+                    return;
+                }
+                self.p.label = Label::default();
+                self.saved = Label::default();
+                self.p.doc_path = None;
+                self.p.sel_rows.clear();
+                self.preview_row = None;
+                self.last_click = None;
+                self.reload_table();
+                self.history = History::new(self.p.label.clone());
+            }
+            MenuCmd::Open => self.open(),
+            MenuCmd::Save => self.save(false),
+            MenuCmd::SaveAs => self.save(true),
+            MenuCmd::ExportPng => self.export_png(),
+            MenuCmd::Print => self.print(),
+        }
+    }
+
+    /// In-window File / Edit menu bar on Windows & Linux (macOS uses the native top menu bar).
+    #[cfg(not(target_os = "macos"))]
+    fn window_menu_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let mut cmd: Option<MenuCmd> = None;
+        let mut open_recent: Option<String> = None;
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.add(egui::Button::new("New").shortcut_text("Ctrl+N")).clicked() {
+                    cmd = Some(MenuCmd::New);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).clicked() {
+                    cmd = Some(MenuCmd::Open);
+                    ui.close();
+                }
+                ui.menu_button("Open Recent", |ui| {
+                    for p in &self.p.recent {
+                        let name = std::path::Path::new(p)
+                            .file_name()
+                            .map_or(p.clone(), |n| n.to_string_lossy().into_owned());
+                        if ui.button(name).on_hover_text(p).clicked() {
+                            open_recent = Some(p.clone());
+                            ui.close();
+                        }
+                    }
+                    if !self.p.recent.is_empty() {
+                        ui.separator();
+                    }
+                    if ui.add_enabled(!self.p.recent.is_empty(), egui::Button::new("Clear Menu")).clicked() {
+                        cmd = Some(MenuCmd::ClearRecent);
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
+                    cmd = Some(MenuCmd::Save);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S")).clicked() {
+                    cmd = Some(MenuCmd::SaveAs);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Export PNG…").shortcut_text("Ctrl+Shift+E")).clicked() {
+                    cmd = Some(MenuCmd::ExportPng);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Print").shortcut_text("Ctrl+P")).clicked() {
+                    cmd = Some(MenuCmd::Print);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add(egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                    cmd = Some(MenuCmd::Undo);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Redo").shortcut_text("Ctrl+Y")).clicked() {
+                    cmd = Some(MenuCmd::Redo);
+                    ui.close();
+                }
+            });
+        });
+        if let Some(path) = open_recent {
+            self.open_path(path.into());
+            self.refresh_recent();
+        }
+        if let Some(c) = cmd {
+            self.run_menu_cmd(ctx, c);
         }
     }
 }
@@ -1916,7 +2006,10 @@ fn table_ui(
         if ui.small_button("Clear").clicked() {
             sel.clear();
         }
+        #[cfg(target_os = "macos")]
         ui.weak(format!("{} of {} rows selected  ·  click a row, ⇧-click for a range", sel.len(), t.rows.len()));
+        #[cfg(not(target_os = "macos"))]
+        ui.weak(format!("{} of {} rows selected  ·  click a row, Shift-click for a range", sel.len(), t.rows.len()));
     });
 
     let font = FontId::proportional(14.0);
@@ -2172,6 +2265,10 @@ impl eframe::App for App {
         self.watch_data(&ctx);
         self.update_preview(&ctx);
 
+        #[cfg(not(target_os = "macos"))]
+        egui::Panel::top("menu").show(ui, |ui| {
+            self.window_menu_bar(&ctx, ui);
+        });
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             self.top_bar(ui);

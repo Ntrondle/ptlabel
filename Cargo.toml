@@ -7,9 +7,6 @@ description = "Fast label app for Brother PT-P710BT (Bluetooth) and PT-E550W (Wi
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["wgpu_no_default_features", "persistence", "default_fonts", "clipboard", "system_fonts"] }
 egui = { version = "0.37", default-features = false }
-# Metal renderer only. eframe's "wgpu" feature would also pull in the Vulkan/GL/DX12/WebGPU backends;
-# glow (OpenGL) keeps ~45 MB more window buffers alive on macOS than a CAMetalLayer.
-egui-wgpu = { version = "0.37", default-features = false, features = ["macos-window-resize-jitter-fix"] }
 cosmic-text = "0.19"
 calamine = { version = "0.38", default-features = false }
 datamatrix = "0.3"
@@ -27,11 +24,24 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Metal renderer only. eframe's "wgpu" feature would also pull in the Vulkan/GL/DX12/WebGPU backends;
+# glow (OpenGL) keeps ~45 MB more window buffers alive on macOS than a CAMetalLayer.
+egui-wgpu = { version = "0.37", default-features = false, features = ["macos-window-resize-jitter-fix"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSRange"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSpellChecker", "NSResponder", "NSApplication", "NSMenu", "NSMenuItem"] }
 # PT-P710BT: the RFCOMM channel is opened directly (src/transport/rfcomm.rs).
 objc2-io-bluetooth = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-foundation", "Bluetooth", "IOBluetoothDevice", "IOBluetoothObject", "IOBluetoothRFCOMMChannel", "IOBluetoothSDPServiceRecord", "IOBluetoothSDPUUID"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "30.0", default-features = false, features = ["dx12", "gles"] }
+windows-sys = { version = "0.59", features = ["Win32_Devices_Bluetooth", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Console"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+wgpu = { version = "30.0", default-features = false, features = ["vulkan", "gles"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 serialport = { version = "4.10", default-features = false }

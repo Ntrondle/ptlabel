@@ -1,7 +1,7 @@
 name: Release build
 
-# Publishing a GitHub release builds PTLabel.dmg on macOS and attaches it.
-# Run manually (Actions → Release build → Run workflow) to get the DMG as an artifact.
+# Publishing a GitHub release builds PTLabel for macOS (.dmg) and Windows (.exe) and attaches both.
+# Run manually (Actions → Release build → Run workflow) to get the builds as artifacts.
 # Pushes to main run it too, to keep the Rust cache warm: a release runs on its tag, and a tag can
 # only restore caches saved on main. Without them every release compiled all ~480 crates twice.
 on:
@@ -18,9 +18,19 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0 # tests need no debuginfo: faster to build, smaller cache
 
 jobs:
-  # Tests and the release build share no artifacts (dev vs release profile), so they run side by side.
-  test:
+  # Tests and release builds share no artifacts (dev vs release profile), so they run side by side.
+  test-macos:
     runs-on: macos-latest # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test
+
+  test-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,16 +68,53 @@ jobs:
           name: ${{ steps.dmg.outputs.file }}
           path: ${{ steps.dmg.outputs.file }}
 
-  # Only a tested build goes on the release (the app updates itself from it).
+  windows:
+    runs-on: windows-latest
+    outputs:
+      exe: ${{ steps.exe.outputs.file }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build Windows executable
+        run: cargo build --release
+
+      - name: Name the EXE
+        id: exe
+        shell: pwsh
+        run: |
+          $V = $env:GITHUB_REF_NAME
+          if ($env:GITHUB_EVENT_NAME -ne "release") { $V = (git rev-parse --short HEAD).Trim() }
+          $F = "PTLabel-$V-windows-x86_64.exe"
+          Copy-Item target/release/ptlabel.exe $F
+          "file=$F" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Get-Item $F
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.exe.outputs.file }}
+          path: ${{ steps.exe.outputs.file }}
+
+  # Only tested builds go on the release (the app updates itself from them).
   attach:
     if: github.event_name == 'release'
-    needs: [test, macos]
+    needs: [test-macos, test-windows, macos, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: ${{ needs.macos.outputs.dmg }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.windows.outputs.exe }}
       - name: Attach to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "${{ needs.macos.outputs.dmg }}" --clobber --repo "$GITHUB_REPOSITORY"
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "${{ needs.macos.outputs.dmg }}" \
+            "${{ needs.windows.outputs.exe }}" \
+            --clobber --repo "$GITHUB_REPOSITORY"

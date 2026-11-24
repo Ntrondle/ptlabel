@@ -1,23 +1,26 @@
 # PTLabel
 
-Fast native macOS label app (Rust + egui) for Brother **PT-P710BT** (Bluetooth) and **PT-E550W** (Wi-Fi). Also speaks to the PT-P750W, which uses the same protocol. Protocol notes and the plan are in `docs/PLAN.md`; Brother's raster spec is in `docs/`.
+Fast native macOS & Windows label app (Rust + egui) for Brother **PT-P710BT** (Bluetooth) and **PT-E550W** (Wi-Fi). Also speaks to the PT-P750W, which uses the same protocol. Protocol notes and the plan are in `docs/PLAN.md`; Brother's raster spec is in `docs/`.
 
 ## Build / install
 
 ```sh
-scripts/bundle.sh --install     # -> ~/Applications/PTLabel.app
-scripts/bundle.sh --dmg         # -> target/PTLabel.dmg (~3.9 MB, drag to Applications)
-python3 scripts/make_icon.py    # regenerate assets/ icon (Pillow; pngquant shrinks it)
+scripts/bundle.sh --install     # macOS: -> ~/Applications/PTLabel.app
+scripts/bundle.sh --dmg         # macOS: -> target/PTLabel.dmg (~3.9 MB, drag to Applications)
+cargo build --release           # Windows: -> target/release/ptlabel.exe (standalone, with icon)
+python3 scripts/make_icon.py    # regenerate assets/ icons (Pillow; pngquant shrinks the icns)
 cargo run                       # dev
 cargo test
 ```
 
-**Updates:** the app checks the repo's latest GitHub release every 6 h (on launch, then 6-hourly). If it's newer, it shows an *Update available* dialog and an *Update to x.y.z…* link in the status bar. **Update now** downloads the DMG, verifies the signature, swaps the app in place and reopens it. A bare `cargo run` binary doesn't check. To release, publish a `vX.Y.Z` GitHub release matching `Cargo.toml`'s version; the workflow attaches the DMG.
+**Updates:** the app checks the repo's latest GitHub release every 6 h (on launch, then 6-hourly). If it's newer, it shows an *Update available* dialog and an *Update to x.y.z…* link in the status bar. **Update now** downloads the release (DMG on macOS, standalone `.exe` on Windows), swaps the app in place and reopens it. A bare `cargo run` binary doesn't check. To release, publish a `vX.Y.Z` GitHub release matching `Cargo.toml`'s version; the workflow builds and attaches both the macOS DMG and Windows EXE.
 
 ## Connecting
 
-- **PT-E550W (Wi-Fi):** found automatically over Bonjour (`_pdl-datastream._tcp`), or type its IP in the top bar. Print data goes over raw TCP 9100. Status and tape detection come from SNMP, because the printer doesn't answer status requests on 9100.
-- **PT-P710BT (Bluetooth):** pair it once in System Settings › Bluetooth. It then shows up in the printer menu (as `/dev/cu.PT-P710BT…`). After that, just turn the printer on: PTLabel opens the printer's serial channel itself through IOBluetooth (macOS asks once for Bluetooth access) and reconnects whenever the printer comes back on. It doesn't use macOS's `/dev/cu` serial bridge, which connects only once per pairing. Don't click **Connect** on the printer in the Bluetooth menu: macOS then hands it to its braille-display service for about a minute.
+- **PT-E550W (Wi-Fi):** found automatically over Bonjour/mDNS (`_pdl-datastream._tcp`), or type its IP in the top bar. Print data goes over raw TCP 9100. Status and tape detection come from SNMP, because the printer doesn't answer status requests on 9100.
+- **PT-P710BT (Bluetooth):**
+  - **macOS:** pair it once in System Settings › Bluetooth. It then shows up in the printer menu (as `/dev/cu.PT-P710BT…`). After that, just turn the printer on: PTLabel opens the printer's serial channel itself through IOBluetooth (macOS asks once for Bluetooth access) and reconnects whenever the printer comes back on. Don't click **Connect** on the printer in the Bluetooth menu: macOS then hands it to its braille-display service for about a minute.
+  - **Windows:** pair it once in Settings › Bluetooth & devices. PTLabel finds paired P-touch printers automatically and opens the RFCOMM SPP channel directly over Winsock (`AF_BTH`)—no manual Bluetooth COM port setup needed (legacy `COM#` ports are also accepted on the CLI).
 
 ## Features
 

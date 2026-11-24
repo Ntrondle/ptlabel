@@ -14,6 +14,7 @@ pub enum MenuCmd {
     Undo,
     Redo,
     /// File › Open Recent entry; its path comes from `take_recent`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     OpenRecent,
     ClearRecent,
 }
