@@ -33,9 +33,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSpellChecker", "NSResponder", "NSApplication", "NSMenu", "NSMenuItem"] }
 
 [profile.release]
-# Small and still fast: size-optimised, whole-program LTO, no unwinding tables.
+# Small and still fast: size-optimised, thin LTO (fat makes the binary ~25% smaller but links
+# ~2.5x slower, on one core), no unwinding tables.
 opt-level = "s"
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true

@@ -6,7 +6,7 @@ Fast native macOS label app (Rust + egui) for Brother **PT-P710BT** (Bluetooth) 
 
 ```sh
 scripts/bundle.sh --install     # -> ~/Applications/PTLabel.app
-scripts/bundle.sh --dmg         # -> target/PTLabel.dmg (~3.2 MB, drag to Applications)
+scripts/bundle.sh --dmg         # -> target/PTLabel.dmg (~3.9 MB, drag to Applications)
 python3 scripts/make_icon.py    # regenerate assets/ icon (Pillow; pngquant shrinks it)
 cargo run                       # dev
 cargo test

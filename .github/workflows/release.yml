@@ -2,7 +2,11 @@ name: Release build
 
 # Publishing a GitHub release builds PTLabel.dmg on macOS and attaches it.
 # Run manually (Actions → Release build → Run workflow) to get the DMG as an artifact.
+# Pushes to main run it too, to keep the Rust cache warm: a release runs on its tag, and a tag can
+# only restore caches saved on main. Without them every release compiled all ~480 crates twice.
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -10,16 +14,31 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0 # tests need no debuginfo: faster to build, smaller cache
+
 jobs:
-  macos:
+  # Tests and the release build share no artifacts (dev vs release profile), so they run side by side.
+  test:
     runs-on: macos-latest # Apple Silicon
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test
 
-      - name: Test
-        run: cargo test
+  macos:
+    runs-on: macos-latest # Apple Silicon
+    outputs:
+      dmg: ${{ steps.dmg.outputs.file }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build app + DMG
         run: scripts/bundle.sh --dmg
@@ -34,13 +53,21 @@ jobs:
           echo "file=$F" >> "$GITHUB_OUTPUT"
           ls -l "$F"
 
-      - name: Attach to release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.dmg.outputs.file }}" --clobber
-
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.dmg.outputs.file }}
           path: ${{ steps.dmg.outputs.file }}
+
+  # Only a tested build goes on the release (the app updates itself from it).
+  attach:
+    if: github.event_name == 'release'
+    needs: [test, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.macos.outputs.dmg }}
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "${{ needs.macos.outputs.dmg }}" --clobber --repo "$GITHUB_REPOSITORY"
