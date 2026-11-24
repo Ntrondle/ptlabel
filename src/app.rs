@@ -233,6 +233,9 @@ pub struct App {
     /// Last clicked sheet row (index into `table.rows`), for ⇧-click ranges.
     last_click: Option<usize>,
     data_checked: Instant,
+    /// Minimized state for the spreadsheet box and each block box.
+    data_collapsed: bool,
+    collapsed: Vec<bool>,
     /// The label as last opened/saved (or new); differs from `p.label` = unsaved changes.
     saved: Label,
     /// A newer release on GitHub ("Update to …" in the status bar), its modal, and install state.
@@ -277,7 +280,8 @@ impl App {
         }
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            s.spacing.button_padding = egui::vec2(8.0, 4.0);
+            s.spacing.button_padding = egui::vec2(10.0, 6.0);
+            s.spacing.interact_size.y = 28.0;
         });
         let history = History::new(p.label.clone());
         let mut app = Self {
@@ -309,6 +313,8 @@ impl App {
             preview_row: None,
             last_click: None,
             data_checked: Instant::now(),
+            data_collapsed: false,
+            collapsed: vec![],
             saved: Label::default(),
             update: None,
             update_modal: false,
@@ -630,10 +636,14 @@ impl App {
 
     /// Snapshot the current label + settings and add it to the printer's queue.
     fn print(&mut self) {
-        let rows = if self.p.label.data.is_some() {
+        let rows = if let Some(src) = &self.p.label.data {
             let rows = self.selected_records();
             if rows.is_empty() {
-                let why = if self.table.is_some() { "Select the spreadsheet rows to print" } else { "Spreadsheet not loaded" };
+                let why = if self.table.is_some() {
+                    if src.by_columns { "Select the spreadsheet columns to print" } else { "Select the spreadsheet rows to print" }
+                } else {
+                    "Spreadsheet not loaded"
+                };
                 self.error(why.into());
                 return;
             }
@@ -751,45 +761,76 @@ impl App {
             Remove,
             Sheet(String),
             Header(bool),
+            ByColumns(bool),
         }
         let mut act: Option<DAct> = None;
+        let units = if src.by_columns { "columns" } else { "rows" };
         egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                icons::collapse_button(ui, &mut self.data_collapsed);
                 icons::show(ui, Icon::Sheet, 18.0);
                 ui.label(RichText::new(src.file_name()).strong()).on_hover_text(&src.path);
-                if let Some(t) = &self.table {
-                    if t.sheets.len() > 1 {
-                        ComboBox::from_id_salt("sheet").selected_text(&t.sheet).show_ui(ui, |ui| {
-                            for sh in &t.sheets {
-                                if ui.selectable_label(*sh == t.sheet, sh).clicked() {
-                                    act = Some(DAct::Sheet(sh.clone()));
-                                }
-                            }
-                        });
+                if self.data_collapsed {
+                    if let Some(t) = &self.table {
+                        ui.weak(format!("·  {} of {} {units} selected", self.p.sel_rows.len(), t.rows.len()));
+                    } else if self.table_err.is_some() {
+                        ui.colored_label(Color32::from_rgb(220, 60, 50), "·  load error");
                     }
-                }
-                let mut hdr = src.header;
-                if ui.checkbox(&mut hdr, "First row = column names").changed() {
-                    act = Some(DAct::Header(hdr));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Remove").on_hover_text("Stop using this spreadsheet").clicked() {
+                    if ui.button("Remove").on_hover_text("Stop using this spreadsheet").clicked() {
                         act = Some(DAct::Remove);
                     }
-                    if ui.small_button("Change…").clicked() {
+                    if ui.button("Change…").clicked() {
                         act = Some(DAct::Change);
                     }
-                    if ui.small_button("Reload").on_hover_text("Re-read the file (automatic when it is saved)").clicked() {
+                    if ui.button("Reload").on_hover_text("Re-read the file (automatic when it is saved)").clicked() {
                         act = Some(DAct::Reload);
                     }
                 });
             });
-            if let Some(e) = &self.table_err {
-                ui.colored_label(Color32::from_rgb(220, 60, 50), e);
-            }
-            if let Some(t) = &self.table {
-                table_ui(ui, t, &mut self.p.sel_rows, &mut self.table_filter, &mut self.preview_row, &mut self.last_click);
+            if !self.data_collapsed {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(t) = &self.table {
+                        if t.sheets.len() > 1 {
+                            ComboBox::from_id_salt("sheet").selected_text(&t.sheet).show_ui(ui, |ui| {
+                                for sh in &t.sheets {
+                                    if ui.selectable_label(*sh == t.sheet, sh).clicked() {
+                                        act = Some(DAct::Sheet(sh.clone()));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    ui.label("Select");
+                    let mut by_cols = src.by_columns;
+                    if ui.selectable_value(&mut by_cols, false, "Rows").on_hover_text("Each selected row prints one label").changed()
+                        || ui.selectable_value(&mut by_cols, true, "Columns").on_hover_text("Each selected column prints one label (transposed)").changed()
+                    {
+                        act = Some(DAct::ByColumns(by_cols));
+                    }
+                    ui.separator();
+                    let mut hdr = src.header;
+                    let hdr_label = if src.by_columns { "First column = field names" } else { "First row = column names" };
+                    if ui.checkbox(&mut hdr, hdr_label).changed() {
+                        act = Some(DAct::Header(hdr));
+                    }
+                });
+                if let Some(e) = &self.table_err {
+                    ui.colored_label(Color32::from_rgb(220, 60, 50), e);
+                }
+                if let Some(t) = &self.table {
+                    table_ui(
+                        ui,
+                        t,
+                        src.by_columns,
+                        &mut self.p.sel_rows,
+                        &mut self.table_filter,
+                        &mut self.preview_row,
+                        &mut self.last_click,
+                    );
+                }
             }
         });
         ui.add_space(6.0);
@@ -810,6 +851,7 @@ impl App {
             }
             Some(DAct::Remove) => {
                 self.p.label.data = None;
+                self.data_collapsed = false;
                 reset(self);
                 self.reload_table();
             }
@@ -823,6 +865,13 @@ impl App {
             Some(DAct::Header(h)) => {
                 if let Some(d) = &mut self.p.label.data {
                     d.header = h;
+                }
+                reset(self);
+                self.reload_table();
+            }
+            Some(DAct::ByColumns(c)) => {
+                if let Some(d) = &mut self.p.label.data {
+                    d.by_columns = c;
                 }
                 reset(self);
                 self.reload_table();
@@ -919,6 +968,8 @@ impl App {
                 self.p.sel_rows.clear();
                 self.preview_row = None;
                 self.last_click = None;
+                self.collapsed.clear();
+                self.data_collapsed = false;
                 self.reload_table();
                 self.p.doc_path = Some(path.display().to_string());
                 self.history = History::new(self.p.label.clone());
@@ -1070,7 +1121,7 @@ impl App {
             let new_host = &mut self.new_host;
             let design_only = self.handle.is_none();
             ComboBox::from_id_salt("printer")
-                .width(330.0)
+                .width(300.0)
                 .selected_text(current)
                 .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
                 .show_ui(ui, |ui| {
@@ -1082,7 +1133,7 @@ impl App {
                             }
                             if let Link::Network(h) = &id.link {
                                 if hosts.contains(h)
-                                    && ui.small_button("Forget").on_hover_text("Remove this IP from the list").clicked()
+                                    && ui.button("Forget").on_hover_text("Remove this IP from the list").clicked()
                                 {
                                     forget = Some(h.clone());
                                 }
@@ -1144,7 +1195,7 @@ impl App {
                     }
                 }
             };
-            if ui.small_button("↻").on_hover_text("Re-read printer status").clicked() {
+            if ui.add(egui::Button::new("↻").min_size(egui::vec2(28.0, 26.0))).on_hover_text("Re-read printer status").clicked() {
                 if let Some(h) = &self.handle {
                     h.refresh();
                 }
@@ -1192,13 +1243,53 @@ impl App {
         let model = self.model();
         let n_sel = self.p.sel_rows.len();
         let has_data = self.p.label.data.is_some();
-        let (records, _) = Pager::counts(&self.p.label, &self.p.settings, n_sel);
+        let by_columns = self.p.label.data.as_ref().is_some_and(|d| d.by_columns);
+        let (unit, units) = if by_columns { ("column", "columns") } else { ("row", "rows") };
+        let (records, total) = Pager::counts(&self.p.label, &self.p.settings, n_sel);
         let multi = has_data || records != Some(1);
-        let s = &mut self.p.settings;
+        let queued = self.handle.as_ref().map(|h| h.queued()).unwrap_or_default();
+        let busy = self.job.is_some() || !queued.is_empty();
+        let label = match total {
+            Some(1) => "Print".to_string(),
+            Some(n) => format!("Print {n} labels"),
+            None => "Print until stopped".to_string(),
+        };
+        let label = if busy { format!("Add to queue · {}", count_text(total)) } else { label };
+        let enabled = self.handle.is_some();
+        let icon_id = egui::IdSalt::new("print-icon");
+        let text_rt = if enabled {
+            RichText::new(label).size(20.0).strong().color(Color32::WHITE)
+        } else {
+            RichText::new(label).size(20.0).strong()
+        };
+        let mut btn = egui::Button::new((egui::Atom::custom(icon_id, egui::Vec2::splat(28.0)), text_rt))
+            .min_size(egui::vec2(ui.available_width(), 58.0));
+        if enabled {
+            btn = btn.fill(ACCENT);
+        }
         ui.add_space(6.0);
-        ui.heading("Print");
-        ui.add_space(4.0);
+        let out = ui.add_enabled_ui(enabled, |ui| btn.atom_ui(ui)).inner;
+        if let Some(r) = out.rect(icon_id) {
+            let col = if enabled { Color32::WHITE } else { ui.style().interact(&out.response).text_color() };
+            icons::paint(ui.painter(), r, Icon::Printer, col);
+        }
+        #[cfg(target_os = "macos")]
+        const PRINT_HINT: &str = "⌘P · jobs queue up while printing";
+        #[cfg(not(target_os = "macos"))]
+        const PRINT_HINT: &str = "Ctrl+P · jobs queue up while printing";
+        if out.response.on_hover_text(PRINT_HINT).clicked() {
+            self.print();
+        }
+        if self.handle.is_none() {
+            ui.weak("Select a printer");
+        } else if has_data && n_sel == 0 {
+            ui.weak(format!("Select {units} in the spreadsheet table"));
+        } else if let Some(w) = self.waiting_reason() {
+            ui.weak(format!("{w}. Jobs wait and print automatically."));
+        }
+        ui.add_space(8.0);
 
+        let s = &mut self.p.settings;
         egui::Grid::new("copies").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
             ui.label(if multi { "Copies each" } else { "Labels" });
             ui.horizontal(|ui| {
@@ -1221,8 +1312,9 @@ impl App {
         let times = if copies > 1 { format!(" × {copies} copies") } else { String::new() };
         if has_data {
             match n_sel {
-                0 => ui.colored_label(Color32::from_rgb(230, 170, 30), "Select spreadsheet rows to print"),
-                n => ui.weak(format!("{n} row{}{times}", if n == 1 { "" } else { "s" })),
+                0 => ui.colored_label(Color32::from_rgb(230, 170, 30), format!("Select spreadsheet {units} to print")),
+                1 => ui.weak(format!("1 {unit}{times}")),
+                n => ui.weak(format!("{n} {units}{times}")),
             };
         } else if self.p.label.sequence().is_some() {
             let v = Vars::default();
@@ -1266,41 +1358,8 @@ impl App {
             ui.add(DragValue::new(&mut o.margin_mm).range(2.0..=127.0).speed(0.1).fixed_decimals(1).suffix(" mm"));
         });
 
-        ui.add_space(10.0);
-        let total = Pager::counts(&self.p.label, s, n_sel).1;
-        let label = match total {
-            Some(1) => "Print".to_string(),
-            Some(n) => format!("Print {n} labels"),
-            None => "Print until stopped".to_string(),
-        };
-        let queued = self.handle.as_ref().map(|h| h.queued()).unwrap_or_default();
-        let busy = self.job.is_some() || !queued.is_empty();
-        let label = if busy { format!("Add to queue · {}", count_text(total)) } else { label };
-        let icon_id = egui::IdSalt::new("print-icon");
-        let btn = egui::Button::new((egui::Atom::custom(icon_id, egui::Vec2::splat(22.0)), RichText::new(label).size(17.0).strong()))
-            .min_size(egui::vec2(ui.available_width(), 42.0));
-        let out = ui.add_enabled_ui(self.handle.is_some(), |ui| btn.atom_ui(ui)).inner;
-        if let Some(r) = out.rect(icon_id) {
-            let col = ui.style().interact(&out.response).text_color();
-            icons::paint(ui.painter(), r, Icon::Printer, col);
-        }
-        #[cfg(target_os = "macos")]
-        const PRINT_HINT: &str = "⌘P · jobs queue up while printing";
-        #[cfg(not(target_os = "macos"))]
-        const PRINT_HINT: &str = "Ctrl+P · jobs queue up while printing";
-        if out.response.on_hover_text(PRINT_HINT).clicked() {
-            self.print();
-        }
-        if self.handle.is_none() {
-            ui.weak("Select a printer");
-        } else if has_data && n_sel == 0 {
-            ui.weak("Select rows in the spreadsheet table");
-        } else if let Some(w) = self.waiting_reason() {
-            ui.weak(format!("{w}. Jobs wait and print automatically."));
-        }
-
         if let Some(r) = &self.job {
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             ui.label(RichText::new(format!("Printing: {}", r.title)).strong());
             let frac = r.total.map_or(0.0, |n| r.done as f32 / n.max(1) as f32);
             let txt = match r.total {
@@ -1309,7 +1368,7 @@ impl App {
             };
             ui.add(egui::ProgressBar::new(frac).text(txt).animate(r.total.is_none()));
             let stop = egui::Button::new(if self.stopping { "Stopping after this label…" } else { "Stop this job" })
-                .min_size(egui::vec2(ui.available_width(), 28.0));
+                .min_size(egui::vec2(ui.available_width(), 34.0));
             if ui.add_enabled(!self.stopping, stop).clicked() {
                 if let Some(h) = &self.handle {
                     h.stop();
@@ -1319,7 +1378,7 @@ impl App {
         }
 
         if !queued.is_empty() {
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             ui.label(RichText::new(format!("Queue ({})", queued.len())).strong());
             let mut cancel = None;
             for (k, (id, title, total)) in queued.iter().enumerate() {
@@ -1327,7 +1386,7 @@ impl App {
                     ui.label(format!("{}. {title}", k + 1));
                     ui.weak(count_text(*total));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() {
                             cancel = Some(*id);
                         }
                     });
@@ -1407,6 +1466,55 @@ impl App {
         });
     }
 
+    fn add_block_bar(&mut self, ui: &mut egui::Ui) {
+        let mut add_excel = false;
+        let blocks = &mut self.p.label.blocks;
+        let collapsed = &mut self.collapsed;
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Add");
+            if icons::button(ui, Icon::Text, "Text").clicked() {
+                blocks.push(Block::Text(TextBlock { text: "Text".into(), ..Default::default() }));
+                collapsed.push(false);
+            }
+            if icons::button(ui, Icon::Sequence, "Sequence")
+                .on_hover_text("Numbered labels: prefix, start, step, count, digits")
+                .clicked()
+            {
+                blocks.push(Block::Sequence(SequenceBlock::default()));
+                collapsed.push(false);
+            }
+            if icons::button(ui, Icon::Sheet, "Excel")
+                .on_hover_text("Print from spreadsheet rows or columns (xlsx, xls, ods, csv)")
+                .clicked()
+            {
+                add_excel = true;
+            }
+            if icons::button(ui, Icon::Qr, "QR code").clicked() {
+                blocks.push(Block::Qr(QrBlock { data: "https://".into(), ..Default::default() }));
+                collapsed.push(false);
+            }
+            if icons::button(ui, Icon::DataMatrix, "Data Matrix").clicked() {
+                blocks.push(Block::DataMatrix(DataMatrixBlock { data: "PTL-{n:04}".into(), ..Default::default() }));
+                collapsed.push(false);
+            }
+            if icons::button(ui, Icon::Barcode, "Barcode").clicked() {
+                blocks.push(Block::Barcode(BarcodeBlock { data: "12345678".into(), ..Default::default() }));
+                collapsed.push(false);
+            }
+            if icons::button(ui, Icon::Image, "Image").clicked() {
+                blocks.push(Block::Image(ImageBlock::default()));
+                collapsed.push(false);
+            }
+            if icons::button(ui, Icon::Spacer, "Spacer").clicked() {
+                blocks.push(Block::Spacer { mm: 3.0 });
+                collapsed.push(false);
+            }
+        });
+        if add_excel {
+            self.add_excel();
+        }
+    }
+
     fn blocks_ui(&mut self, ui: &mut egui::Ui) {
         enum Act {
             Up,
@@ -1416,12 +1524,14 @@ impl App {
         }
         let mut act: Option<(usize, Act)> = None;
         let n = self.p.label.blocks.len();
+        self.collapsed.resize(n, false);
         let fonts = &self.fonts;
         let filter = &mut self.font_filter;
         let speller = &mut self.speller;
         let target = &mut self.spell_target;
         let headers: Vec<String> = self.table.as_ref().map(|t| t.headers.to_vec()).unwrap_or_default();
         let rows_drive = self.p.label.data.is_some();
+        let by_columns = self.p.label.data.as_ref().is_some_and(|d| d.by_columns);
         let seq_count = self.p.label.sequences().count();
         let seq_in_text: Vec<bool> = (0..seq_count).map(|k| self.p.label.sequence_in_text(k)).collect();
         let mut seq_idx = 0usize;
@@ -1435,9 +1545,11 @@ impl App {
             } else {
                 None
             };
+            let minimized = &mut self.collapsed[i];
             egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    icons::collapse_button(ui, minimized);
                     icons::show(ui, block_icon(b), 18.0);
                     if let Some((k, ph, _)) = &seq_info {
                         let title = if seq_count > 1 { format!("Sequence {}", k + 1) } else { "Sequence".into() };
@@ -1446,40 +1558,48 @@ impl App {
                     } else {
                         ui.label(RichText::new(b.kind_name()).strong());
                     }
+                    if *minimized {
+                        let summary = block_summary(b);
+                        if !summary.is_empty() {
+                            ui.weak(format!("·  {summary}"));
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Remove").clicked() {
+                        if ui.button("Remove").clicked() {
                             act = Some((i, Act::Del));
                         }
-                        if ui.add_enabled(i + 1 < n, egui::Button::new("↓").small()).clicked() {
+                        if ui.add_enabled(i + 1 < n, egui::Button::new("↓").min_size(egui::vec2(28.0, 26.0))).clicked() {
                             act = Some((i, Act::Down));
                         }
-                        if ui.add_enabled(i > 0, egui::Button::new("↑").small()).clicked() {
+                        if ui.add_enabled(i > 0, egui::Button::new("↑").min_size(egui::vec2(28.0, 26.0))).clicked() {
                             act = Some((i, Act::Up));
                         }
-                        if ui.small_button("Duplicate").clicked() {
+                        if ui.button("Duplicate").clicked() {
                             act = Some((i, Act::Dup));
                         }
                     });
                 });
-                match b {
-                    Block::Text(t) => text_editor(ui, i, t, fonts, filter, speller, target, &headers),
-                    Block::Sequence(q) => {
-                        let (_, ph, in_text) = seq_info.as_ref().unwrap();
-                        sequence_editor(ui, i, q, fonts, filter, rows_drive, *in_text, ph);
-                    }
-                    Block::Qr(q) => qr_editor(ui, i, q, &headers),
-                    Block::DataMatrix(d) => dm_editor(ui, i, d, &headers),
-                    Block::Barcode(bc) => barcode_editor(ui, i, bc, &headers),
-                    Block::Image(im) => {
-                        if image_editor(ui, im) {
-                            picked_image = Some(i);
+                if !*minimized {
+                    match b {
+                        Block::Text(t) => text_editor(ui, i, t, fonts, filter, speller, target, &headers),
+                        Block::Sequence(q) => {
+                            let (_, ph, in_text) = seq_info.as_ref().unwrap();
+                            sequence_editor(ui, i, q, fonts, filter, rows_drive, by_columns, *in_text, ph);
                         }
-                    }
-                    Block::Spacer { mm } => {
-                        ui.horizontal(|ui| {
-                            ui.label("Width");
-                            ui.add(DragValue::new(mm).range(0.5..=300.0).speed(0.1).fixed_decimals(1).suffix(" mm"));
-                        });
+                        Block::Qr(q) => qr_editor(ui, i, q, &headers),
+                        Block::DataMatrix(d) => dm_editor(ui, i, d, &headers),
+                        Block::Barcode(bc) => barcode_editor(ui, i, bc, &headers),
+                        Block::Image(im) => {
+                            if image_editor(ui, im) {
+                                picked_image = Some(i);
+                            }
+                        }
+                        Block::Spacer { mm } => {
+                            ui.horizontal(|ui| {
+                                ui.label("Width");
+                                ui.add(DragValue::new(mm).range(0.5..=300.0).speed(0.1).fixed_decimals(1).suffix(" mm"));
+                            });
+                        }
                     }
                 }
             });
@@ -1496,63 +1616,36 @@ impl App {
         }
         let blocks = &mut self.p.label.blocks;
         match act {
-            Some((i, Act::Up)) => blocks.swap(i, i - 1),
-            Some((i, Act::Down)) => blocks.swap(i, i + 1),
+            Some((i, Act::Up)) => {
+                blocks.swap(i, i - 1);
+                self.collapsed.swap(i, i - 1);
+            }
+            Some((i, Act::Down)) => {
+                blocks.swap(i, i + 1);
+                self.collapsed.swap(i, i + 1);
+            }
             Some((i, Act::Del)) => {
                 blocks.remove(i);
+                self.collapsed.remove(i);
             }
             Some((i, Act::Dup)) => {
                 let c = blocks[i].clone();
                 blocks.insert(i + 1, c);
+                let col = self.collapsed[i];
+                self.collapsed.insert(i + 1, col);
             }
             None => {}
         }
 
         ui.add_space(4.0);
-        let mut add_excel = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.weak("Add");
-            if icons::button(ui, Icon::Text, "Text").clicked() {
-                blocks.push(Block::Text(TextBlock { text: "Text".into(), ..Default::default() }));
-            }
-            if icons::button(ui, Icon::Sequence, "Sequence")
-                .on_hover_text("Numbered labels: prefix, start, step, count, digits")
-                .clicked()
-            {
-                blocks.push(Block::Sequence(SequenceBlock::default()));
-            }
-            if icons::button(ui, Icon::Sheet, "Excel")
-                .on_hover_text("Print from spreadsheet rows (xlsx, xls, ods, csv)")
-                .clicked()
-            {
-                add_excel = true;
-            }
-            if icons::button(ui, Icon::Qr, "QR code").clicked() {
-                blocks.push(Block::Qr(QrBlock { data: "https://".into(), ..Default::default() }));
-            }
-            if icons::button(ui, Icon::DataMatrix, "Data Matrix").clicked() {
-                blocks.push(Block::DataMatrix(DataMatrixBlock { data: "PTL-{n:04}".into(), ..Default::default() }));
-            }
-            if icons::button(ui, Icon::Barcode, "Barcode").clicked() {
-                blocks.push(Block::Barcode(BarcodeBlock { data: "12345678".into(), ..Default::default() }));
-            }
-            if icons::button(ui, Icon::Image, "Image").clicked() {
-                blocks.push(Block::Image(ImageBlock::default()));
-            }
-            if icons::button(ui, Icon::Spacer, "Spacer").clicked() {
-                blocks.push(Block::Spacer { mm: 3.0 });
-            }
-        });
         let seq_hints = (0..seq_count.max(1)).map(sequence_placeholder).collect::<Vec<_>>().join("  ");
         let mut hint = format!("Placeholders: {{n}}  {{n:03}}  {seq_hints}  {{date}}  {{time}}");
         if !headers.is_empty() {
             let cols: Vec<String> = headers.iter().take(8).map(|h| format!("{{{h}}}")).collect();
-            hint += &format!("   ·   Columns: {}", cols.join("  "));
+            let label = if by_columns { "Fields" } else { "Columns" };
+            hint += &format!("   ·   {label}: {}", cols.join("  "));
         }
         ui.weak(hint);
-        if add_excel {
-            self.add_excel();
-        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1662,6 +1755,8 @@ impl App {
                 self.p.sel_rows.clear();
                 self.preview_row = None;
                 self.last_click = None;
+                self.collapsed.clear();
+                self.data_collapsed = false;
                 self.reload_table();
                 self.history = History::new(self.p.label.clone());
             }
@@ -1887,7 +1982,7 @@ fn field_menu(ui: &mut egui::Ui, target: &mut String, headers: &[String], space:
         });
     })
     .response
-    .on_hover_text("Insert a spreadsheet column");
+    .on_hover_text("Insert a spreadsheet field");
 }
 
 /// Font, size, B/I/U, alignment (shared by text and sequence blocks).
@@ -1949,9 +2044,11 @@ fn sequence_editor(
     fonts: &[String],
     filter: &mut String,
     rows_drive: bool,
+    by_columns: bool,
     in_text: bool,
     placeholder: &str,
 ) {
+    let (unit, units) = if by_columns { ("column", "columns") } else { ("row", "rows") };
     ui.horizontal_wrapped(|ui| {
         ui.label("Prefix");
         ui.add(TextEdit::singleline(&mut q.prefix).desired_width(70.0).hint_text("A-"));
@@ -1965,11 +2062,11 @@ fn sequence_editor(
         ui.add(TextEdit::singleline(&mut q.suffix).desired_width(70.0));
         ui.add_enabled(!rows_drive, egui::Label::new("Count"));
         ui.add_enabled(!rows_drive, DragValue::new(&mut q.count).range(1..=99_999).speed(0.2))
-            .on_disabled_hover_text("The selected spreadsheet rows set the count");
+            .on_disabled_hover_text(format!("The selected spreadsheet {units} set the count"));
     });
     let v = Vars::default();
     let txt = if rows_drive {
-        format!("{}, {}, …  one number per selected row", q.format(0, &v), q.format(1, &v))
+        format!("{}, {}, …  one number per selected {unit}", q.format(0, &v), q.format(1, &v))
     } else if q.count <= 1 {
         q.format(0, &v)
     } else {
@@ -1983,33 +2080,35 @@ fn sequence_editor(
     }
 }
 
-/// Spreadsheet rows: click toggles, ⇧-click selects a range; virtualised for big sheets.
+/// Spreadsheet rows or columns: click toggles, ⇧-click selects a range; virtualised for big sheets.
 fn table_ui(
     ui: &mut egui::Ui,
     t: &Table,
+    by_columns: bool,
     sel: &mut Vec<usize>,
     filter: &mut String,
     preview_row: &mut Option<usize>,
     last: &mut Option<usize>,
 ) {
     use egui::{Align2, Rect, Sense, pos2, vec2};
+    let (unit, units) = if by_columns { ("column", "columns") } else { ("row", "rows") };
     let f = filter.to_lowercase();
     let visible: Vec<usize> = (0..t.rows.len())
         .filter(|&i| f.is_empty() || t.rows[i].iter().any(|c| c.to_lowercase().contains(&f)))
         .collect();
-    ui.horizontal(|ui| {
-        ui.add(TextEdit::singleline(filter).hint_text("Search rows…").desired_width(200.0));
-        if ui.small_button("Select all").on_hover_text("All rows shown").clicked() {
+    ui.horizontal_wrapped(|ui| {
+        ui.add(TextEdit::singleline(filter).hint_text(format!("Search {units}…")).desired_width(200.0));
+        if ui.button("Select all").on_hover_text(format!("All {units} shown")).clicked() {
             let have: std::collections::HashSet<usize> = sel.iter().copied().collect();
             sel.extend(visible.iter().filter(|i| !have.contains(i)));
         }
-        if ui.small_button("Clear").clicked() {
+        if ui.button("Clear").clicked() {
             sel.clear();
         }
         #[cfg(target_os = "macos")]
-        ui.weak(format!("{} of {} rows selected  ·  click a row, ⇧-click for a range", sel.len(), t.rows.len()));
+        ui.weak(format!("{} of {} {units} selected  ·  click a {unit}, ⇧-click for a range", sel.len(), t.rows.len()));
         #[cfg(not(target_os = "macos"))]
-        ui.weak(format!("{} of {} rows selected  ·  click a row, Shift-click for a range", sel.len(), t.rows.len()));
+        ui.weak(format!("{} of {} {units} selected  ·  click a {unit}, Shift-click for a range", sel.len(), t.rows.len()));
     });
 
     let font = FontId::proportional(14.0);
@@ -2024,7 +2123,7 @@ fn table_ui(
             (w + 22.0).clamp(40.0, 280.0)
         })
         .collect();
-    let (chk_w, num_w, row_h) = (26.0, 40.0, 22.0);
+    let (chk_w, num_w, row_h) = (28.0, 42.0, 24.0);
     let total_w = (chk_w + num_w + widths.iter().sum::<f32>()).max(ui.available_width());
     let (sel_bg, sel_fg, hov_bg, stripe, fg, weak, strong) = {
         let v = ui.visuals();
@@ -2053,6 +2152,13 @@ fn table_ui(
     egui::ScrollArea::horizontal().id_salt("data_h").show(ui, |ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(total_w, row_h), Sense::hover());
         ui.painter().rect_filled(rect, 3.0, stripe);
+        ui.painter().text(
+            pos2(rect.min.x + chk_w + num_w - 8.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            if by_columns { "Col" } else { "#" },
+            FontId::proportional(12.0),
+            weak,
+        );
         cells(ui.painter(), rect, &t.headers, strong);
         egui::ScrollArea::vertical()
             .id_salt("data_v")
@@ -2071,7 +2177,7 @@ fn table_ui(
                     } else if vi % 2 == 1 {
                         p.rect_filled(rect, 0.0, stripe);
                     }
-                    let b = Rect::from_center_size(pos2(rect.min.x + chk_w / 2.0, rect.center().y), egui::Vec2::splat(13.0));
+                    let b = Rect::from_center_size(pos2(rect.min.x + chk_w / 2.0, rect.center().y), egui::Vec2::splat(14.0));
                     if on {
                         p.rect_filled(b, 3.0, accent);
                         let c = b.center();
@@ -2085,7 +2191,7 @@ fn table_ui(
                     p.text(
                         pos2(rect.min.x + chk_w + num_w - 8.0, rect.center().y),
                         Align2::RIGHT_CENTER,
-                        t.row_numbers[ri].to_string(),
+                        &t.row_labels[ri],
                         FontId::proportional(12.0),
                         weak,
                     );
@@ -2167,6 +2273,40 @@ fn block_icon(b: &Block) -> Icon {
         Block::Barcode(_) => Icon::Barcode,
         Block::Image(_) => Icon::Image,
         Block::Spacer { .. } => Icon::Spacer,
+    }
+}
+
+/// One-line summary shown in the header of a minimized block box.
+fn block_summary(b: &Block) -> String {
+    let cut = |s: &str| -> String {
+        let s = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        if s.chars().count() > 40 {
+            format!("{}…", s.chars().take(40).collect::<String>())
+        } else {
+            s.to_string()
+        }
+    };
+    match b {
+        Block::Text(t) => cut(&t.text),
+        Block::Sequence(q) => {
+            let v = Vars::default();
+            if q.count <= 1 {
+                q.format(0, &v)
+            } else {
+                format!("{} → {} ({})", q.format(0, &v), q.format(q.count as u64 - 1, &v), q.count)
+            }
+        }
+        Block::Qr(q) => cut(&q.data),
+        Block::DataMatrix(d) => cut(&d.data),
+        Block::Barcode(bc) => {
+            let d = cut(&bc.data);
+            if d.is_empty() { bc.kind.name().into() } else { format!("{}: {d}", bc.kind.name()) }
+        }
+        Block::Image(im) => std::path::Path::new(&im.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "no image".into()),
+        Block::Spacer { mm } => format!("{mm:.1} mm"),
     }
 }
 
@@ -2282,6 +2422,8 @@ impl eframe::App for App {
             self.preview_ui(ui);
             ui.add_space(6.0);
             self.label_options(ui);
+            ui.add_space(4.0);
+            self.add_block_bar(ui);
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 self.data_panel(ui);

@@ -15,13 +15,15 @@ pub struct DataSource {
     pub path: String,
     /// Sheet name; empty or unknown = first sheet.
     pub sheet: String,
-    /// The first non-empty row holds the column names.
+    /// The first non-empty row (or column when `by_columns`) holds the field names.
     pub header: bool,
+    /// When true, each column is one label (transposed); otherwise each row is one label.
+    pub by_columns: bool,
 }
 
 impl Default for DataSource {
     fn default() -> Self {
-        Self { path: String::new(), sheet: String::new(), header: true }
+        Self { path: String::new(), sheet: String::new(), header: true, by_columns: false }
     }
 }
 
@@ -57,8 +59,8 @@ pub struct Table {
     pub sheet: String,
     pub headers: Arc<Vec<String>>,
     pub rows: Vec<Vec<String>>,
-    /// Row number as shown in the spreadsheet (1-based), per row.
-    pub row_numbers: Vec<usize>,
+    /// Row number ("2", "3", …) or column letter ("A", "B", …) in the spreadsheet, per record.
+    pub row_labels: Vec<String>,
     pub mtime: Option<SystemTime>,
 }
 
@@ -84,7 +86,7 @@ pub fn load(src: &DataSource) -> Result<Table> {
     } else {
         read_sheet(path, &src.sheet)?
     };
-    Ok(build(grid, first, src.header, sheets, sheet, modified))
+    Ok(build(grid, first, src.header, src.by_columns, sheets, sheet, modified))
 }
 
 /// (sheet names, loaded sheet, cells, (row, column) of the first cell).
@@ -270,33 +272,66 @@ fn build(
     grid: Vec<Vec<String>>,
     (first_row, first_col): (usize, usize),
     header: bool,
+    by_columns: bool,
     sheets: Vec<String>,
     sheet: String,
     mtime: Option<SystemTime>,
 ) -> Table {
-    let mut rows: Vec<(usize, Vec<String>)> = grid
+    let mut non_empty_rows: Vec<(usize, Vec<String>)> = grid
         .into_iter()
         .enumerate()
         .map(|(i, r)| (first_row + i + 1, r))
         .filter(|(_, r)| r.iter().any(|c| !c.trim().is_empty()))
         .collect();
-    let width = rows.iter().filter_map(|(_, r)| r.iter().rposition(|c| !c.trim().is_empty())).max().map_or(0, |p| p + 1);
-    for (_, r) in &mut rows {
+    let width = non_empty_rows
+        .iter()
+        .filter_map(|(_, r)| r.iter().rposition(|c| !c.trim().is_empty()))
+        .max()
+        .map_or(0, |p| p + 1);
+    for (_, r) in &mut non_empty_rows {
         r.resize(width, String::new());
     }
-    let mut headers: Vec<String> = if header && !rows.is_empty() {
-        let (_, h) = rows.remove(0);
-        h.into_iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let s = s.replace(['{', '}'], "").split_whitespace().collect::<Vec<_>>().join(" ");
-                if s.is_empty() { col_letter(first_col + i) } else { s }
-            })
-            .collect()
-    } else {
-        (0..width).map(|i| col_letter(first_col + i)).collect()
+
+    let sanitize = |s: String, fallback: String| -> String {
+        let s = s.replace(['{', '}'], "").split_whitespace().collect::<Vec<_>>().join(" ");
+        if s.is_empty() { fallback } else { s }
     };
-    // Duplicate names get " 2", " 3"… so every column can be addressed.
+
+    let (mut records, mut headers): (Vec<(String, Vec<String>)>, Vec<String>) = if by_columns {
+        let row_nums: Vec<usize> = non_empty_rows.iter().map(|(n, _)| *n).collect();
+        let mut cols: Vec<(String, Vec<String>)> = (0..width)
+            .map(|c| {
+                let col: Vec<String> = non_empty_rows.iter().map(|(_, r)| r[c].clone()).collect();
+                (col_letter(first_col + c), col)
+            })
+            .filter(|(_, col)| col.iter().any(|v| !v.trim().is_empty()))
+            .collect();
+        let headers = if header && !cols.is_empty() {
+            let (_, h) = cols.remove(0);
+            h.into_iter()
+                .enumerate()
+                .map(|(i, s)| sanitize(s, format!("Row {}", row_nums[i])))
+                .collect()
+        } else {
+            row_nums.iter().map(|n| format!("Row {n}")).collect()
+        };
+        (cols, headers)
+    } else {
+        let mut rows: Vec<(String, Vec<String>)> =
+            non_empty_rows.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
+        let headers = if header && !rows.is_empty() {
+            let (_, h) = rows.remove(0);
+            h.into_iter()
+                .enumerate()
+                .map(|(i, s)| sanitize(s, col_letter(first_col + i)))
+                .collect()
+        } else {
+            (0..width).map(|i| col_letter(first_col + i)).collect()
+        };
+        (rows, headers)
+    };
+
+    // Duplicate names get " 2", " 3"… so every field can be addressed.
     for i in 1..headers.len() {
         let mut k = 2;
         let base = headers[i].clone();
@@ -305,8 +340,8 @@ fn build(
             k += 1;
         }
     }
-    let (row_numbers, rows) = rows.into_iter().unzip();
-    Table { sheets, sheet, headers: Arc::new(headers), rows, row_numbers, mtime }
+    let (row_labels, rows) = records.drain(..).unzip();
+    Table { sheets, sheet, headers: Arc::new(headers), rows, row_labels, mtime }
 }
 
 #[cfg(test)]
@@ -316,11 +351,11 @@ mod tests {
     #[test]
     fn csv_quotes_delimiters_and_headers() {
         let g = parse_csv("Part;Value;Note\r\nR1;10k;\"say \"\"hi\"\"; ok\"\n\nC1;100n;\"two\nlines\"\n");
-        let t = build(g, (0, 0), true, vec![], String::new(), None);
+        let t = build(g, (0, 0), true, false, vec![], String::new(), None);
         assert_eq!(*t.headers, vec!["Part", "Value", "Note"]);
         assert_eq!(t.rows[0], vec!["R1", "10k", "say \"hi\"; ok"]);
         assert_eq!(t.rows[1][2], "two\nlines");
-        assert_eq!(t.row_numbers, vec![2, 4]);
+        assert_eq!(t.row_labels, vec!["2", "4"]);
         let r = t.record(1).unwrap();
         assert_eq!(r.get("value"), Some("100n"));
         assert_eq!(r.get("Missing"), None);
@@ -329,9 +364,9 @@ mod tests {
     #[test]
     fn letters_dupes_and_numbers() {
         assert_eq!((col_letter(0), col_letter(25), col_letter(26), col_letter(701)), ("A".into(), "Z".into(), "AA".into(), "ZZ".into()));
-        let t = build(vec![vec!["X".into(), "".into(), "X".into()], vec!["1".into(), "2".into(), "3".into()]], (4, 0), true, vec![], String::new(), None);
+        let t = build(vec![vec!["X".into(), "".into(), "X".into()], vec!["1".into(), "2".into(), "3".into()]], (4, 0), true, false, vec![], String::new(), None);
         assert_eq!(*t.headers, vec!["X", "B", "X 2"]);
-        assert_eq!(t.row_numbers, vec![6]);
+        assert_eq!(t.row_labels, vec!["6"]);
         assert_eq!((number(1001.0), number(0.1 + 0.2), number(2.5)), ("1001".into(), "0.3".into(), "2.5".into()));
         let dt = |v, ty, is_1904| excel_date(&calamine::ExcelDateTime::new(v, ty, is_1904));
         use calamine::ExcelDateTimeType::DateTime;
@@ -386,8 +421,24 @@ mod tests {
     #[test]
     fn column_letters_follow_the_sheet_offset() {
         let g = || vec![vec!["".to_string(), "Qty".into()], vec!["R1".into(), "5".into()]];
-        assert_eq!(*build(g(), (2, 2), true, vec![], String::new(), None).headers, vec!["C", "Qty"]);
-        assert_eq!(*build(g(), (2, 2), false, vec![], String::new(), None).headers, vec!["C", "D"]);
+        assert_eq!(*build(g(), (2, 2), true, false, vec![], String::new(), None).headers, vec!["C", "Qty"]);
+        assert_eq!(*build(g(), (2, 2), false, false, vec![], String::new(), None).headers, vec!["C", "D"]);
+    }
+
+    #[test]
+    fn by_columns_transposes_sheet_with_or_without_header() {
+        let g = || parse_csv("Field;Tube 1;Tube 2\nConc;10 mM;20 mM\n;extra;note\n");
+        let with_hdr = build(g(), (0, 0), true, true, vec![], String::new(), None);
+        assert_eq!(*with_hdr.headers, vec!["Field", "Conc", "Row 3"]);
+        assert_eq!(with_hdr.row_labels, vec!["B", "C"]);
+        assert_eq!(with_hdr.rows[0], vec!["Tube 1", "10 mM", "extra"]);
+        assert_eq!(with_hdr.rows[1], vec!["Tube 2", "20 mM", "note"]);
+        assert_eq!(with_hdr.record(1).unwrap().get("Conc"), Some("20 mM"));
+
+        let no_hdr = build(g(), (1, 2), false, true, vec![], String::new(), None);
+        assert_eq!(*no_hdr.headers, vec!["Row 2", "Row 3", "Row 4"]);
+        assert_eq!(no_hdr.row_labels, vec!["C", "D", "E"]);
+        assert_eq!(no_hdr.rows[0], vec!["Field", "Conc", ""]);
     }
 
     #[test]

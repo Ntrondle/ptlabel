@@ -14,6 +14,8 @@ pub enum Icon {
     Printer,
     Sequence,
     Sheet,
+    ChevronDown,
+    ChevronRight,
 }
 
 impl Icon {
@@ -120,6 +122,14 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, col: Color32) {
             tri(at(0.17, 0.50), at(0.38, 0.33), at(0.38, 0.67));
             tri(at(0.83, 0.50), at(0.62, 0.33), at(0.62, 0.67));
         }
+        Icon::ChevronDown => {
+            let bold = Stroke::new((side / 7.0).max(1.8), col);
+            p.add(Shape::line(vec![at(0.18, 0.32), at(0.50, 0.68), at(0.82, 0.32)], bold));
+        }
+        Icon::ChevronRight => {
+            let bold = Stroke::new((side / 7.0).max(1.8), col);
+            p.add(Shape::line(vec![at(0.32, 0.18), at(0.68, 0.50), at(0.32, 0.82)], bold));
+        }
     }
 }
 
@@ -156,10 +166,29 @@ pub fn show(ui: &mut Ui, icon: Icon, size: f32) -> Response {
     resp
 }
 
+/// Upside-down arrow button to minimize/expand a panel or block box.
+pub fn collapse_button(ui: &mut Ui, collapsed: &mut bool) -> Response {
+    let icon = if *collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
+    let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&resp);
+        if resp.hovered() || resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, 4.0, visuals.weak_bg_fill);
+        }
+        paint(ui.painter(), rect.shrink(5.0), icon, visuals.text_color());
+    }
+    if resp.clicked() {
+        *collapsed = !*collapsed;
+    }
+    resp.on_hover_text(if *collapsed { "Expand" } else { "Minimize" })
+}
+
 /// Native button with a leading icon.
 pub fn button(ui: &mut Ui, icon: Icon, text: &str) -> Response {
     let id = egui::IdSalt::new(icon);
-    let out = egui::Button::new((egui::Atom::custom(id, vec2(16.0 * icon.aspect(), 16.0)), text)).atom_ui(ui);
+    let out = egui::Button::new((egui::Atom::custom(id, vec2(18.0 * icon.aspect(), 18.0)), egui::RichText::new(text).size(14.0)))
+        .min_size(vec2(0.0, 32.0))
+        .atom_ui(ui);
     if let Some(r) = out.rect(id) {
         let col = ui.style().interact(&out.response).text_color();
         paint(ui.painter(), r, icon, col);
