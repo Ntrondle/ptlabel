@@ -294,12 +294,12 @@ mod tests {
     fn turned_off_drops_port() {
         let m = Mock { replies: VecDeque::from([vec![frame(12, ST_TURNED_OFF)]]), ..Default::default() };
         let mut t = transport(m);
-        assert!(t.status().is_err());
+        assert!(format!("{:#}", t.status().unwrap_err()).contains("turned off"));
         assert!(t.port.is_none());
 
         let m = Mock { rx: VecDeque::from([frame(12, 0x06), frame(12, ST_TURNED_OFF)]), ..Default::default() };
         let mut t = transport(m);
-        assert!(t.send_page(&[0x1A], 10.0).is_err());
+        assert!(format!("{:#}", t.send_page(&[0x1A], 10.0).unwrap_err()).contains("turned off"));
         assert!(t.port.is_none());
     }
 
@@ -310,7 +310,7 @@ mod tests {
         assert!(format!("{:#}", t.status().unwrap_err()).contains("closed"));
         assert!(t.port.is_none());
         let mut t = transport(Mock { write_zero: true, ..Default::default() });
-        assert!(t.status().is_err());
+        assert!(format!("{:#}", t.status().unwrap_err()).contains("closed"));
         assert!(t.port.is_none());
         assert!(start.elapsed() < Duration::from_secs(2));
     }

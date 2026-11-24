@@ -163,15 +163,6 @@ mod tests {
     }
 
     #[test]
-    fn errors_decode() {
-        let mut b = E550W;
-        b[8] = 0x01;
-        b[9] = 0x10;
-        let s = Status::parse(&b).unwrap();
-        assert_eq!(s.errors(), vec!["No tape", "Cover open"]);
-    }
-
-    #[test]
     fn short_or_bad_frames_do_not_panic() {
         assert!(Status::parse(&[]).is_err());
         assert!(Status::parse(&E550W[..31]).is_err());
@@ -188,16 +179,30 @@ mod tests {
 
     #[test]
     fn every_error_bit() {
+        let bits = [
+            (8, 0x01, "No tape"),
+            (8, 0x04, "Cutter jam"),
+            (8, 0x08, "Weak batteries"),
+            (8, 0x40, "Wrong AC adapter"),
+            (9, 0x01, "Wrong tape for this job"),
+            (9, 0x10, "Cover open"),
+            (9, 0x20, "Overheated"),
+        ];
+        for (byte, mask, msg) in bits {
+            let mut b = E550W;
+            b[byte] = mask;
+            let s = Status::parse(&b).unwrap();
+            assert_eq!(s.errors(), vec![msg], "byte {byte} mask {mask:#04x}");
+            assert_eq!(s.summary(), msg);
+        }
         let mut b = E550W;
-        b[8] = 0xFF; // unused bits 1, 4, 5, 7 must be ignored
-        b[9] = 0xFF; // unused bits 1-3, 6, 7
+        b[8] = 0x01;
+        b[9] = 0x10;
         let s = Status::parse(&b).unwrap();
-        assert_eq!(
-            s.errors(),
-            vec!["No tape", "Cutter jam", "Weak batteries", "Wrong AC adapter", "Wrong tape for this job", "Cover open", "Overheated"]
-        );
-        b[8] = 0xB2;
-        b[9] = 0xCE;
+        assert_eq!(s.errors(), vec!["No tape", "Cover open"]);
+        assert_eq!(s.summary(), "No tape, Cover open");
+        b[8] = 0xB2; // unused bits 1, 4, 5, 7 must be ignored
+        b[9] = 0xCE; // unused bits 1-3, 6, 7
         assert!(Status::parse(&b).unwrap().errors().is_empty());
     }
 

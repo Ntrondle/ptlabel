@@ -110,11 +110,11 @@ mod tests {
         h.observe(&0, ms(t, 0), true, true); // press
         h.observe(&5, ms(t, 100), true, false);
         h.observe(&9, ms(t, 300), true, false);
-        h.observe(&9, ms(t, 2000), true, false); // held still: not done yet
-        assert!(h.undo.is_empty());
-        h.observe(&9, ms(t, 2100), false, false); // released
-        assert_eq!(h.undo, vec![0]);
-        assert_eq!(h.head, 9);
+        h.observe(&9, ms(t, 2000), true, false); // held still past IDLE: must not split the drag
+        h.observe(&12, ms(t, 2050), true, false);
+        h.observe(&12, ms(t, 2100), false, false); // released
+        assert_eq!(h.undo(&12), Some(0));
+        assert_eq!(h.undo(&0), None);
     }
 
     #[test]
@@ -163,8 +163,13 @@ mod tests {
         assert_eq!(l.len(), MAX_RECENT);
         assert_eq!(&l[..3], ["/f5", "/f11", "/f10"]);
         assert_eq!(l.iter().filter(|p| *p == "/f5").count(), 1);
-        let mut l = vec![concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml").to_string(), "/no/such.ptlabel".into()];
+        let cargo_toml = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let mut l = vec![
+            cargo_toml.to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
+            "/no/such.ptlabel".into(),
+        ];
         prune_recent(&mut l);
-        assert_eq!(l.len(), 1);
+        assert_eq!(l, [cargo_toml]);
     }
 }

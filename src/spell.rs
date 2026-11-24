@@ -213,13 +213,14 @@ mod tests {
     #[test]
     fn flags_typos_not_placeholders() {
         let mut s = Speller::new();
-        let m = s.check("Teh quick brwn fox {n:03} café");
+        let text = "Teh quick brwn fox {brwn} {n:03} café";
+        let m = s.check(text);
         let words: Vec<&str> = m.iter().map(|x| x.word.as_str()).collect();
         assert!(words.contains(&"Teh"), "{words:?}");
-        assert!(words.contains(&"brwn"), "{words:?}");
-        assert!(!words.iter().any(|w| w.contains('n') && w.len() == 1));
+        assert_eq!(words.iter().filter(|&&w| w == "brwn").count(), 1, "{words:?}");
         let brwn = m.iter().find(|x| x.word == "brwn").unwrap();
-        assert!(s.suggestions("Teh quick brwn fox {n:03} café", brwn).iter().any(|g| g == "brown"));
+        assert_eq!(brwn.start, 10);
+        assert!(s.suggestions(text, brwn).iter().any(|g| g == "brown"));
     }
 
     #[test]
@@ -234,12 +235,5 @@ mod tests {
         let mut t = text.to_string();
         replace_chars(&mut t, m[2].start, m[2].end, "brown");
         assert_eq!(t, "Grüße 😀 Teh {n:03} brown");
-    }
-
-    #[test]
-    fn replace_handles_multibyte() {
-        let mut t = "é brwn".to_string();
-        replace_chars(&mut t, 2, 6, "brown");
-        assert_eq!(t, "é brown");
     }
 }

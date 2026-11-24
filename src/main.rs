@@ -8,8 +8,6 @@ mod icons;
 mod job;
 mod label;
 mod menu;
-#[cfg(test)]
-mod perf;
 mod printer;
 mod proto;
 mod spell;

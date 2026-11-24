@@ -2321,9 +2321,11 @@ mod tests {
         assert!(pv.warnings.is_empty() && !pv.overflow);
         assert_eq!(pv.tex.size()[1], tape.tape_dots as usize * PREVIEW_SCALE);
         assert_eq!(pv.phys[1], tape.tape_dots as f32);
-        // A small GPU texture limit drops the scale instead of exceeding it.
+        // A small GPU texture limit drops the scale and crops instead of exceeding it.
         let small = render_preview(&ctx, &renderer, 8, &Label::default(), &tape, &Vars::default(), &opts, 64);
         assert_eq!(small.tex.size()[1], tape.tape_dots as usize);
+        assert!(small.tex.size()[0] <= 64, "width {}", small.tex.size()[0]);
+        assert!(small.warnings.iter().any(|w| w.contains("Preview shows the first")), "{:?}", small.warnings);
         assert_eq!(small.phys[1], pv.phys[1]);
     }
 

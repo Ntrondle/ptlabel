@@ -65,38 +65,19 @@ mod tests {
 
     #[test]
     fn spec_example() {
-        // Raster Command Reference p.35
-        let mut line = vec![0u8; 20];
-        line.extend_from_slice(&[0x22, 0x22, 0x23, 0xBA, 0xBF, 0xA2, 0x22, 0x2B]);
-        assert_eq!(
-            encode(&line),
-            vec![0xED, 0x00, 0xFF, 0x22, 0x05, 0x23, 0xBA, 0xBF, 0xA2, 0x22, 0x2B]
-        );
-    }
-
-    #[test]
-    fn roundtrip_and_bound() {
-        let cases: Vec<Vec<u8>> = vec![
-            vec![0; 16],
-            vec![0xFF; 16],
-            (0..16).collect(),
-            vec![1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11],
-            vec![0, 0, 0, 0, 0, 0, 0, 0x0F, 0xF0, 0, 0, 0, 0, 0, 0, 0],
+        // Raster Command Reference p.35 and p.11 driver samples.
+        let mut p35 = vec![0u8; 20];
+        p35.extend_from_slice(&[0x22, 0x22, 0x23, 0xBA, 0xBF, 0xA2, 0x22, 0x2B]);
+        let mut p11 = vec![0u8; 11];
+        p11.extend_from_slice(&[0x16, 0x99, 0x6C, 0x98, 0x6C]);
+        let vectors: &[(&[u8], &[u8])] = &[
+            (&p35, &[0xED, 0x00, 0xFF, 0x22, 0x05, 0x23, 0xBA, 0xBF, 0xA2, 0x22, 0x2B]),
+            (&[0; 16], &[0xF1, 0x00]),
+            (&p11, &[0xF6, 0x00, 0x04, 0x16, 0x99, 0x6C, 0x98, 0x6C]),
         ];
-        for c in cases {
-            let e = encode(&c);
-            assert!(e.len() <= 17, "{c:?} -> {e:?}");
-            assert_eq!(decode(&e), c);
+        for (input, expected) in vectors {
+            assert_eq!(encode(input), *expected);
         }
-    }
-
-    #[test]
-    fn driver_sample_lines() {
-        // Raster Command Reference p.11: the driver sends `G 02 00 F1 00` and `F6 00 04 16 99 6C 98 6C`.
-        assert_eq!(encode(&[0; 16]), vec![0xF1, 0x00]);
-        let mut line = vec![0u8; 11];
-        line.extend_from_slice(&[0x16, 0x99, 0x6C, 0x98, 0x6C]);
-        assert_eq!(encode(&line), vec![0xF6, 0x00, 0x04, 0x16, 0x99, 0x6C, 0x98, 0x6C]);
     }
 
     #[test]

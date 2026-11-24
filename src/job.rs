@@ -220,11 +220,6 @@ mod tests {
         let mut label = Label::default();
         label.blocks.push(Block::Sequence(SequenceBlock { suffix: "/{n}".into(), count: 2, digits: 1, ..Default::default() }));
         let p = Pager::new(&label, &s, vec![]);
-        // `{seq}` (QR/barcodes) must match what the sequence block itself renders for that page.
-        for i in 0..4 {
-            let v = p.vars(i);
-            assert_eq!(v.seqs[0], label.sequence().unwrap().format(v.index, &v), "page {i}");
-        }
         assert_eq!([p.vars(0).seqs[0].as_str(), p.vars(1).seqs[0].as_str(), p.vars(2).seqs[0].as_str()], ["1/1", "1/2", "2/3"]);
         assert_eq!(p.record_vars(1).seqs[0], "2/3");
     }

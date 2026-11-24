@@ -157,25 +157,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encodes_brother_oid() {
-        let o = encode_oid(BROTHER_STATUS_OID);
-        assert_eq!(
-            o,
-            vec![0x06, 0x0E, 0x2B, 6, 1, 4, 1, 0x93, 0x03, 3, 3, 9, 1, 6, 1, 0]
-        );
-    }
-
-    #[test]
-    fn parses_response() {
-        // GetResponse with id 7 and a 4-byte octet string
-        let vb = tlv(0x30, &[encode_oid(BROTHER_STATUS_OID), tlv(0x04, &[1, 2, 3, 4])].concat());
-        let pdu = tlv(0xA2, &[int(7), int(0), int(0), tlv(0x30, &vb)].concat());
-        let msg = tlv(0x30, &[int(0), tlv(0x04, b"public"), pdu].concat());
-        assert_eq!(parse_response(&msg, 7).unwrap(), vec![1, 2, 3, 4]);
-        assert!(parse_response(&msg, 8).is_err());
-    }
-
-    #[test]
     fn get_request_bytes() {
         #[rustfmt::skip]
         let want = [

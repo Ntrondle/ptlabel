@@ -188,15 +188,18 @@ mod tests {
         let mut bm = Bitmap::new(1, 128);
         bm.px[0] = 1; // top row -> pin 127 -> byte 0 MSB
         bm.px[127] = 1; // bottom row -> pin 0 -> byte 15 LSB
-        let l = raster_line(&bm, 0, tape.pin_offset());
-        assert_eq!(l[0], 0x80);
-        assert_eq!(l[15], 0x01);
+        assert_eq!(
+            raster_line(&bm, 0, tape.pin_offset()),
+            [0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]
+        );
 
         let tape = Tape::tze(12).unwrap(); // 70 pins at offset 29
         let mut bm = Bitmap::new(1, 70);
-        bm.px[69] = 1; // bottom row -> pin 29
-        let l = raster_line(&bm, 0, tape.pin_offset());
-        assert_eq!(l[15 - 29 / 8], 1 << (29 % 8));
+        bm.px[69] = 1; // bottom row -> pin 29 -> byte 12 bit 5
+        assert_eq!(
+            raster_line(&bm, 0, tape.pin_offset()),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -279,11 +282,14 @@ mod tests {
         assert_eq!(term, 0x1A);
         assert_eq!(lines.len(), 64);
         for (x, l) in lines.iter().enumerate() {
-            assert_eq!(*l, raster_line(&bm, x, tape.pin_offset()), "line {x}");
-            // Pins outside the 12 mm print area (0..29, 99..128) stay blank.
             let bits = u128::from_be_bytes(*l);
-            assert_eq!(bits & ((1 << 29) - 1), 0);
-            assert_eq!(bits >> 99, 0);
+            // Pins outside the 12 mm print area (0..29, 99..128) stay blank.
+            assert_eq!(bits & ((1 << 29) - 1), 0, "line {x} low margin");
+            assert_eq!(bits >> 99, 0, "line {x} high margin");
+            for y in 0..bm.h {
+                let pin = 29 + (bm.h - 1 - y);
+                assert_eq!((bits >> pin) & 1 != 0, bm.get(x, y), "line {x} row {y}");
+            }
         }
     }
 

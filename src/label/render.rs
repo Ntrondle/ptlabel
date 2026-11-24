@@ -712,7 +712,7 @@ fn reduce(c: &Canvas, high_res: bool) -> Bitmap {
 
 /// Physical tape image (cassette colours, margins) from a print bitmap, at 180 dpi.
 /// Pixel-exact: used for the CLI `render` output.
-pub fn preview_rgba(bm: &Bitmap, tape: &Tape, opts: &PageOpts) -> (usize, usize, Vec<u8>) {
+fn preview_rgba(bm: &Bitmap, tape: &Tape, opts: &PageOpts) -> (usize, usize, Vec<u8>) {
     let xs = if opts.high_res { 2 } else { 1 };
     let content_w = bm.w.div_ceil(xs);
     let margin = margin_dots(opts.margin_mm, false) as usize;
@@ -801,6 +801,19 @@ mod tests {
         // ink reaches near the top of the print area (caps fill the ascent)
         let first_row = (0..out.bitmap.h).find(|&y| (0..out.bitmap.w).any(|x| out.bitmap.get(x, y))).unwrap();
         assert!(first_row < 20, "first ink row {first_row}");
+        // Italic overhang beyond the advance width (Times italic "f") clips cleanly instead of panicking.
+        let italic = Label {
+            blocks: vec![Block::Text(TextBlock {
+                text: "jff".into(),
+                font: "Times New Roman".into(),
+                italic: true,
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let out = r.render(&italic, &tape, &Vars::default(), &PageOpts::default());
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.bitmap.px.iter().any(|&p| p != 0));
     }
 
     #[test]
@@ -849,7 +862,30 @@ mod tests {
         };
         let out = r.render(&label, &tape, &Vars::default(), &PageOpts::default());
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(!out.overflow);
         assert_eq!(out.bitmap.h, 128);
+        // Version 2 QR (25 modules) + 4-module quiet zones on each side = 33 modules at 5 dots/module.
+        let m = 5usize;
+        assert_eq!(out.bitmap.w, 33 * m);
+        let ink_rows = (0..out.bitmap.h)
+            .filter(|&y| (0..out.bitmap.w).any(|x| out.bitmap.get(x, y)))
+            .count();
+        assert_eq!(ink_rows, 25 * m);
+        // Every dark/light run along every inked row is an exact multiple of module width `m` (crisp after SS=2).
+        for y in 0..out.bitmap.h {
+            let mut x = 0;
+            while x < out.bitmap.w {
+                let v = out.bitmap.get(x, y);
+                let start = x;
+                while x < out.bitmap.w && out.bitmap.get(x, y) == v {
+                    x += 1;
+                }
+                assert_eq!((x - start) % m, 0, "unaligned run at y={y} x={start}..{x}");
+            }
+        }
+        // Oversized payload for 4 mm tape (24 pins < 25 modules) warns instead of panicking.
+        let tiny = r.render(&label, &Tape::tze(4).unwrap(), &Vars::default(), &PageOpts::default());
+        assert!(tiny.warnings.iter().any(|w| w.contains("too much data")), "{:?}", tiny.warnings);
     }
 
     #[test]
@@ -879,20 +915,6 @@ mod tests {
         let a = r.render(&mk("Inductors"), &tape, &Vars::default(), &o).bitmap;
         let b = r.render(&mk("\nInductors \n"), &tape, &Vars::default(), &o).bitmap;
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn fill_clips_instead_of_panicking() {
-        let mut c = Canvas::new(4, 3);
-        c.fill(6, 1, 1, 1, 255); // glyph pixel right of the canvas (italic overhang)
-        c.fill(1, 5, 1, 1, 255);
-        c.fill(3, 0, 5, 1, 255);
-        assert_eq!(c.px.iter().filter(|&&p| p != 0).count(), 1);
-        // Italic overhang beyond the advance width (Times italic "f") used to panic.
-        let mut r = Renderer::new();
-        let t = TextBlock { text: "jff".into(), font: "Times New Roman".into(), italic: true, ..Default::default() };
-        let label = Label { blocks: vec![Block::Text(t)], ..Default::default() };
-        r.render(&label, &Tape::tze(12).unwrap(), &Vars::default(), &PageOpts::default());
     }
 
     #[test]
@@ -1065,7 +1087,17 @@ mod tests {
             }
             assert!(fast.px == slow.px, "blit at {x},{y}");
         }
-        for (x, y, w, h, a) in [(3, 4, 1, 1, 200), (-1, 0, 1, 1, 255), (69, 39, 1, 1, 9), (70, 5, 1, 1, 255), (2, 2, 9, 7, 0), (-3, -2, 9, 7, 77), (60, 35, 20, 20, 255)] {
+        for (x, y, w, h, a) in [
+            (3, 4, 1, 1, 200),
+            (-1, 0, 1, 1, 255),
+            (0, -1, 1, 1, 255),
+            (69, 39, 1, 1, 9),
+            (70, 5, 1, 1, 255),
+            (5, 40, 1, 1, 255),
+            (2, 2, 9, 7, 0),
+            (-3, -2, 9, 7, 77),
+            (60, 35, 20, 20, 255),
+        ] {
             let mut fast = noise(70, 40, 3);
             let mut slow = fast.clone();
             fast.fill(x, y, w, h, a);

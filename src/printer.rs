@@ -53,7 +53,7 @@ impl PrinterHandle {
         Self::spawn_with(id, t, renderer, notify)
     }
 
-    pub fn spawn_with(
+    fn spawn_with(
         id: PrinterId,
         mut t: Box<dyn Transport>,
         renderer: Arc<Mutex<Renderer>>,

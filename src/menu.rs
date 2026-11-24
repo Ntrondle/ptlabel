@@ -33,20 +33,6 @@ mod imp {
 
     static SINK: OnceLock<(Sender<MenuCmd>, egui::Context)> = OnceLock::new();
 
-    fn from_tag(t: isize) -> Option<MenuCmd> {
-        use MenuCmd::*;
-        [New, Open, Save, SaveAs, ExportPng, Print].into_iter().find(|c| *c as isize == t)
-    }
-
-    #[test]
-    fn tags_round_trip() {
-        use MenuCmd::*;
-        for c in [New, Open, Save, SaveAs, Print] {
-            assert_eq!(from_tag(c as isize), Some(c));
-        }
-        assert_eq!(from_tag(0), None); // NSMenuItem's default tag
-    }
-
     define_class!(
         // SAFETY: NSObject has no subclassing requirements and Target has no Drop impl.
         #[unsafe(super(NSObject))]
@@ -57,7 +43,7 @@ mod imp {
         impl Target {
             #[unsafe(method(ptlabelMenu:))]
             fn menu(&self, sender: &NSMenuItem) {
-                if let (Some((tx, ctx)), Some(cmd)) = (SINK.get(), from_tag(sender.tag()).or_else(|| other_tag(sender.tag()))) {
+                if let (Some((tx, ctx)), Some(cmd)) = (SINK.get(), cmd_from_tag(sender.tag())) {
                     let _ = tx.send(cmd);
                     ctx.request_repaint();
                 }
@@ -140,14 +126,16 @@ mod imp {
     /// Path of the Open Recent entry clicked last.
     static RECENT_PICK: Mutex<Option<String>> = Mutex::new(None);
 
-    fn other_tag(t: isize) -> Option<MenuCmd> {
+    fn cmd_from_tag(t: isize) -> Option<MenuCmd> {
         use MenuCmd::*;
         if t >= RECENT_TAG {
             let path = RECENT.with_borrow(|r| r.as_ref()?.2.get((t - RECENT_TAG) as usize).cloned())?;
             *RECENT_PICK.lock().unwrap() = Some(path);
             return Some(OpenRecent);
         }
-        [Undo, Redo, ClearRecent].into_iter().find(|c| *c as isize == t)
+        [New, Open, Save, SaveAs, ExportPng, Print, Undo, Redo, ClearRecent]
+            .into_iter()
+            .find(|c| *c as isize == t)
     }
 
     fn item(mtm: MainThreadMarker, target: &Target, title: &str, key: &str, tag: isize) -> Retained<NSMenuItem> {
@@ -190,6 +178,23 @@ mod imp {
     /// Path of the Open Recent entry behind the last `MenuCmd::OpenRecent`.
     pub fn take_recent() -> Option<String> {
         RECENT_PICK.lock().unwrap().take()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tags_round_trip() {
+            use MenuCmd::*;
+            for c in [New, Open, Save, SaveAs, ExportPng, Print, Undo, Redo, ClearRecent] {
+                assert!((c as isize) < RECENT_TAG);
+                assert_eq!(cmd_from_tag(c as isize), Some(c));
+            }
+            assert_eq!(cmd_from_tag(0), None); // NSMenuItem's default tag
+            assert_eq!(cmd_from_tag(OpenRecent as isize), None); // recent items use RECENT_TAG + i
+            assert_eq!(cmd_from_tag(RECENT_TAG), None);
+        }
     }
 }
 

@@ -194,25 +194,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn print_areas_are_centred_on_head() {
-        for w in TZE_WIDTHS {
-            let t = Tape::tze(w).unwrap();
-            assert_eq!(t.pin_offset() * 2 + t.print_pins as usize, HEAD_PINS);
-        }
-        assert_eq!(Tape::tze(12).unwrap().pin_offset(), 29);
-        assert_eq!(Tape::tze(4).unwrap().pin_offset(), 52);
-        assert_eq!(Tape::tze(24).unwrap().pin_offset(), 0);
-    }
-
-    #[test]
-    fn heat_shrink_nearest() {
-        let t = Tape::from_status(9, 0x17, 0x70, 0x08).unwrap();
-        assert_eq!(t.print_pins, 44);
-        let t = Tape::from_status(24, 0x11, 0x70, 0x08).unwrap();
-        assert_eq!(t.print_pins, 128);
-    }
-
-    #[test]
     fn left_margin_pins_match_spec_tables() {
         // Raster Command Reference 2.3.5: (status width, media type, print pins, left-margin pins).
         let cases = [
@@ -235,6 +216,10 @@ mod tests {
         for (w, kind, pins, left) in cases {
             let t = Tape::from_status(w, kind, 0x01, 0x08).unwrap();
             assert_eq!((t.print_pins, t.pin_offset()), (pins, left), "width {w} kind {kind:#x}");
+        }
+        for w in TZE_WIDTHS {
+            let t = Tape::tze(w).unwrap();
+            assert_eq!(t.pin_offset() * 2 + t.print_pins as usize, HEAD_PINS);
         }
         assert!(Tape::from_status(0, 0x01, 0x01, 0x08).is_none());
         assert!(Tape::from_status(12, 0x00, 0x01, 0x08).is_none());
