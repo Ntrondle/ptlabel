@@ -33,10 +33,12 @@ fn pick_v4(addrs: impl IntoIterator<Item = Ipv4Addr>) -> Option<Ipv4Addr> {
     addrs.into_iter().min_by_key(|ip| (ip.is_link_local(), *ip))
 }
 
-/// Paired P-touch Bluetooth SPP printers.
+/// Connected USB and paired Bluetooth SPP P-touch printers on Windows.
 #[cfg(target_os = "windows")]
 pub fn scan_serial() -> Vec<PrinterId> {
-    super::bt_win::scan_paired()
+    let mut v = super::usb_win::scan_usb();
+    v.extend(super::bt_win::scan_paired());
+    v
 }
 
 /// Paired P-touch SPP devices, e.g. /dev/cu.PT-P710BT6431.

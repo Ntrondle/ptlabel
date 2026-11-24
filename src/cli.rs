@@ -12,8 +12,8 @@ use std::time::Duration;
 
 const USAGE: &str = "\
 ptlabel                         open the app
-ptlabel list                    find printers (Bluetooth + Wi-Fi)
-ptlabel status <target>         read status (target = IP/host, /dev/cu.PT-..., bt:PT-... or COM#)
+ptlabel list                    find printers (USB + Bluetooth + Wi-Fi)
+ptlabel status <target>         read status (target = IP/host, usb, /dev/cu.PT-..., bt:PT-... or COM#)
 ptlabel render [opts] [text]    render to PNG (--out FILE, --tape MM)
 ptlabel print <target> [opts] [text]
 options: --label FILE.ptlabel  --copies N  --no-cut  --half-cut  --chain  --hires
@@ -111,7 +111,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
             }
             for p in v.iter() {
                 let target = match &p.link {
-                    crate::transport::Link::Bluetooth(s) | crate::transport::Link::Network(s) => s,
+                    crate::transport::Link::Bluetooth(s)
+                    | crate::transport::Link::Usb(s)
+                    | crate::transport::Link::Network(s) => s,
                 };
                 println!("{:<40} {}", p.display(), target);
             }

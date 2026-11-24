@@ -14,14 +14,18 @@ trait Port: Read + Write + Send {}
 impl<T: Read + Write + Send> Port for T {}
 
 pub struct BtTransport {
-    /// /dev/cu.<name> of the paired printer, e.g. /dev/cu.PT-P710BT6431.
+    /// Device path / identifier (`/dev/cu.<name>`, `bt:<name>`, `COM<n>`, or Windows USB path).
     path: String,
+    usb: bool,
     port: Option<Box<dyn Port>>,
     buf: Vec<u8>,
 }
 
 #[cfg(target_os = "macos")]
-fn connect(path: &str) -> Result<Box<dyn Port>> {
+fn connect(path: &str, usb: bool) -> Result<Box<dyn Port>> {
+    if usb {
+        bail!("USB printing is currently only supported on Windows");
+    }
     let name = path.strip_prefix("bt:").unwrap_or(path);
     let name = name.rsplit('/').next().unwrap_or(name);
     let name = name.trim_start_matches("cu.").trim_start_matches("tty.");
@@ -29,7 +33,10 @@ fn connect(path: &str) -> Result<Box<dyn Port>> {
 }
 
 #[cfg(target_os = "windows")]
-fn connect(path: &str) -> Result<Box<dyn Port>> {
+fn connect(path: &str, usb: bool) -> Result<Box<dyn Port>> {
+    if usb {
+        return Ok(Box::new(super::usb_win::UsbPrint::open(path)?));
+    }
     if super::is_com_port(path) {
         use anyhow::Context;
         let p = serialport::new(path, 115_200)
@@ -43,7 +50,10 @@ fn connect(path: &str) -> Result<Box<dyn Port>> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn connect(path: &str) -> Result<Box<dyn Port>> {
+fn connect(path: &str, usb: bool) -> Result<Box<dyn Port>> {
+    if usb {
+        bail!("USB printing is currently only supported on Windows");
+    }
     use anyhow::Context;
     let p = serialport::new(path, 115_200)
         .timeout(Duration::from_millis(100))
@@ -54,12 +64,20 @@ fn connect(path: &str) -> Result<Box<dyn Port>> {
 
 impl BtTransport {
     pub fn new(path: String) -> Self {
-        Self { path, port: None, buf: Vec::new() }
+        Self { path, usb: false, port: None, buf: Vec::new() }
+    }
+
+    pub fn new_usb(path: String) -> Self {
+        Self { path, usb: true, port: None, buf: Vec::new() }
+    }
+
+    fn kind(&self) -> &'static str {
+        if self.usb { "USB" } else { "Bluetooth" }
     }
 
     fn port(&mut self) -> Result<&mut Box<dyn Port>> {
         if self.port.is_none() {
-            self.port = Some(connect(&self.path)?);
+            self.port = Some(connect(&self.path, self.usb)?);
             self.buf.clear();
         }
         Ok(self.port.as_mut().unwrap())
@@ -71,6 +89,7 @@ impl BtTransport {
     }
 
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        let kind = self.kind();
         // No-progress timeout: a long page over slow SPP may take longer than 30 s in total.
         let mut deadline = Instant::now() + Duration::from_secs(30);
         let mut off = 0;
@@ -80,7 +99,7 @@ impl BtTransport {
             match r {
                 Ok(0) => {
                     self.drop_port();
-                    bail!("Bluetooth write failed: link closed");
+                    bail!("{kind} write failed: link closed");
                 }
                 Ok(n) => {
                     off += n;
@@ -89,12 +108,12 @@ impl BtTransport {
                 Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
                     if Instant::now() > deadline {
                         self.drop_port();
-                        bail!("Bluetooth write timed out");
+                        bail!("{kind} write timed out");
                     }
                 }
                 Err(e) => {
                     self.drop_port();
-                    return Err(anyhow!(e).context("Bluetooth write failed"));
+                    return Err(anyhow!(e).context(format!("{kind} write failed")));
                 }
             }
         }
@@ -103,6 +122,7 @@ impl BtTransport {
 
     /// Read the next 32-byte status frame (reply or unsolicited notification).
     fn read_frame(&mut self, timeout: Duration) -> Result<Option<Status>> {
+        let kind = self.kind();
         let deadline = Instant::now() + timeout;
         loop {
             if let Some((s, used)) = Status::find(&self.buf) {
@@ -118,13 +138,13 @@ impl BtTransport {
                 // Raw tty (VMIN=1): read() only returns 0 at end of file, i.e. the link hung up.
                 Ok(0) => {
                     self.drop_port();
-                    bail!("Bluetooth link closed");
+                    bail!("{kind} link closed");
                 }
                 Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
                 Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::WouldBlock) => {}
                 Err(e) => {
                     self.drop_port();
-                    return Err(anyhow!(e).context("Bluetooth read failed"));
+                    return Err(anyhow!(e).context(format!("{kind} read failed")));
                 }
             }
         }
@@ -137,6 +157,7 @@ impl BtTransport {
     }
 
     fn request_status(&mut self) -> Result<Status> {
+        let kind = self.kind();
         self.write_all(&status::REQUEST)?;
         match self.read_frame(Duration::from_secs(4))? {
             Some(s) if s.status_type() == ST_TURNED_OFF => {
@@ -146,7 +167,7 @@ impl BtTransport {
             Some(s) => Ok(s),
             None => {
                 self.drop_port(); // force reconnect next time
-                bail!("no status reply over Bluetooth")
+                bail!("no status reply over {kind}")
             }
         }
     }

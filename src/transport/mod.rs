@@ -6,6 +6,8 @@ pub mod net;
 #[cfg(target_os = "macos")]
 mod rfcomm;
 pub mod snmp;
+#[cfg(target_os = "windows")]
+mod usb_win;
 
 use crate::proto::{Caps, Status};
 use anyhow::Result;
@@ -13,8 +15,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Link {
-    /// macOS serial device for a paired Bluetooth SPP printer, e.g. /dev/cu.PT-P710BT6431
+    /// macOS serial device or Windows `bt:<name>` / `COM<n>` for a paired Bluetooth SPP printer
     Bluetooth(String),
+    /// USB printer interface path (Windows `\\?\usb#...` via usbprint.sys)
+    Usb(String),
     /// Host/IP of a Wi-Fi printer (raw 9100 + SNMP)
     Network(String),
 }
@@ -33,6 +37,7 @@ impl PrinterId {
                 self.model,
                 p.trim_start_matches("/dev/cu.").trim_start_matches("bt:")
             ),
+            Link::Usb(_) => format!("{} · USB", self.model),
             Link::Network(h) => format!("{} · Wi-Fi {h}", self.model),
         }
     }
@@ -43,13 +48,20 @@ impl PrinterId {
         Caps { half_cut: full, cut_every: full }
     }
 
-    /// Parse a CLI target: `/dev/...`, `bt:<name-or-MAC>`, Windows `COM<n>`, or a Wi-Fi host/IP.
+    /// Parse a CLI target: `/dev/...`, `bt:<name-or-MAC>`, `usb` / `usb:<model>` / `\\?\usb...`,
+    /// Windows `COM<n>`, or a Wi-Fi host/IP.
     pub fn from_target(t: &str) -> Self {
         if t.starts_with("/dev/") {
             let name = t.trim_start_matches("/dev/cu.").trim_start_matches("/dev/tty.");
             Self { model: discovery::model_from_name(name), link: Link::Bluetooth(t.into()) }
         } else if let Some(name) = t.strip_prefix("bt:").or_else(|| t.strip_prefix("BT:")) {
             Self { model: discovery::model_from_name(name), link: Link::Bluetooth(format!("bt:{name}")) }
+        } else if t.eq_ignore_ascii_case("usb")
+            || t.starts_with("usb:")
+            || t.starts_with("USB:")
+            || t.to_ascii_lowercase().starts_with(r"\\?\usb")
+        {
+            Self { model: "PT-P710BT".into(), link: Link::Usb(t.into()) }
         } else if is_com_port(t) {
             Self { model: "PT-P710BT".into(), link: Link::Bluetooth(t.to_ascii_uppercase()) }
         } else {
@@ -60,6 +72,7 @@ impl PrinterId {
     pub fn open(&self) -> Box<dyn Transport> {
         match &self.link {
             Link::Bluetooth(p) => Box::new(bt::BtTransport::new(p.clone())),
+            Link::Usb(p) => Box::new(bt::BtTransport::new_usb(p.clone())),
             Link::Network(h) => Box::new(net::NetTransport::new(h.clone())),
         }
     }
@@ -110,6 +123,10 @@ mod tests {
         assert!(is_com_port(r"\\.\COM12"));
         assert!(!is_com_port("com"));
         assert!(!is_com_port("company.local"));
+
+        let usb = PrinterId::from_target("usb");
+        assert_eq!(usb.link, Link::Usb("usb".into()));
+        assert_eq!(usb.display(), "PT-P710BT · USB");
 
         let net = PrinterId::from_target("192.168.1.160");
         assert_eq!(net.link, Link::Network("192.168.1.160".into()));

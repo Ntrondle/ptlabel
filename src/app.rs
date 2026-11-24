@@ -1142,7 +1142,7 @@ impl App {
                     }
                     if list.is_empty() {
                         #[cfg(target_os = "windows")]
-                        ui.weak("Searching… pair the PT-P710BT in Settings › Bluetooth & devices");
+                        ui.weak("Searching… plug in via USB (Editor Lite off) or pair Bluetooth in Settings › Bluetooth & devices");
                         #[cfg(not(target_os = "windows"))]
                         ui.weak("Searching… pair the PT-P710BT in System Settings › Bluetooth");
                     }

@@ -1,8 +1,8 @@
 [package]
 name = "ptlabel"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2024"
-description = "Fast label app for Brother PT-P710BT (Bluetooth) and PT-E550W (Wi-Fi)"
+description = "Fast label app for Brother P-touch printers (USB, Bluetooth, Wi-Fi)"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["wgpu_no_default_features", "persistence", "default_fonts", "clipboard", "system_fonts"] }
@@ -35,7 +35,17 @@ objc2-io-bluetooth = { version = "0.3", default-features = false, features = ["s
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { version = "30.0", default-features = false, features = ["dx12", "gles"] }
-windows-sys = { version = "0.59", features = ["Win32_Devices_Bluetooth", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Console"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Devices_Bluetooth",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"

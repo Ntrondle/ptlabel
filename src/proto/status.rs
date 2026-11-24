@@ -66,6 +66,7 @@ impl Status {
         match self.model_code() {
             0x66 => Some("PT-E550W"),
             0x68 => Some("PT-P750W"),
+            0x71 => Some("PT-P710BT"),
             _ => None,
         }
     }
