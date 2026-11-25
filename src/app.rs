@@ -1,7 +1,7 @@
 //! egui front end: printer bar, live preview, block editor, print panel.
 
 use crate::data::{self, DataSource, Record, Table};
-use crate::dev_ui::{DevUi, UiConfig};
+use crate::dev_ui::{DevUi, ThemeMode, UiConfig};
 use crate::history::{self, History};
 use crate::job::{Pager, PrintJob, PrintSettings};
 use crate::label::render::{PREVIEW_SCALE, Renderer, canvas_length_mm, preview_smooth, save_png};
@@ -94,6 +94,10 @@ struct Persist {
     sel_rows: Vec<usize>,
     /// User-resizable height of the live label preview box (logical pixels).
     preview_height: f32,
+    /// Appearance preference (System / Light / Dark).
+    theme: ThemeMode,
+    /// Periodically check GitHub Releases for newer versions.
+    auto_check_updates: bool,
 }
 
 impl Default for Persist {
@@ -109,6 +113,8 @@ impl Default for Persist {
             recent: vec![],
             sel_rows: vec![],
             preview_height: 220.0,
+            theme: ThemeMode::System,
+            auto_check_updates: true,
         }
     }
 }
@@ -283,9 +289,15 @@ pub struct App {
     update_modal: bool,
     updating: bool,
     update_error: Option<String>,
+    checking_update: bool,
+    /// Status message from the last update check (message, is_error), shown in Settings.
+    update_status: Option<(String, bool)>,
     /// The last look for a newer release; update checks and installs answer on `upd`.
     checked: Option<Instant>,
     upd: (crossbeam_channel::Sender<Upd>, crossbeam_channel::Receiver<Upd>),
+    /// Settings modal (PTLabel › Settings… / ⌘,).
+    settings_modal: bool,
+    settings_host_input: String,
     /// Live UI config (`dev-ui.json` watcher + Dev Inspector in `--features dev` builds).
     dev: DevUi,
     /// Optional automated screenshot capture path (`PTLABEL_SCREENSHOT` env var, used by CI/scripts).
@@ -316,7 +328,9 @@ enum DialogRes {
 }
 
 enum Upd {
-    Found(crate::update::Release),
+    Found { release: crate::update::Release, manual: bool },
+    UpToDate { manual: bool },
+    CheckFailed { err: String, manual: bool },
     /// The new app is in place (its path), or why not.
     Installed(Result<std::path::PathBuf, String>),
 }
@@ -421,8 +435,12 @@ impl App {
             update_modal: false,
             updating: false,
             update_error: None,
+            checking_update: false,
+            update_status: None,
             checked: None,
             upd: crossbeam_channel::unbounded(),
+            settings_modal: false,
+            settings_host_input: String::new(),
             dev: DevUi::new(),
             screenshot_path: std::env::var("PTLABEL_SCREENSHOT").ok().filter(|s| !s.is_empty()),
             screenshot_frames: 0,
@@ -604,22 +622,41 @@ impl App {
 
     /// Look for a newer release now and then (only an app bundle can update itself; disabled in dev).
     fn check_update(&mut self, ctx: &egui::Context) {
-        if cfg!(feature = "dev") || self.checked.is_some_and(|t| t.elapsed() < UPDATE_EVERY) || crate::update::bundle().is_none() {
+        if !self.p.auto_check_updates
+            || cfg!(feature = "dev")
+            || self.checking_update
+            || self.checked.is_some_and(|t| t.elapsed() < UPDATE_EVERY)
+            || crate::update::bundle().is_none()
+        {
             return;
         }
-        self.checked = Some(Instant::now());
         // Idle frames don't come by themselves: wake up for the next check.
         ctx.request_repaint_after(UPDATE_EVERY);
+        self.spawn_update_check(ctx, false);
+    }
+
+    /// Trigger an immediate update check from the menu bar or Settings.
+    fn manual_check_update(&mut self, ctx: &egui::Context) {
+        if self.checking_update {
+            return;
+        }
+        self.update_status = Some(("Checking for updates…".into(), false));
+        self.info("Checking for updates…".into());
+        self.spawn_update_check(ctx, true);
+    }
+
+    fn spawn_update_check(&mut self, ctx: &egui::Context, manual: bool) {
+        self.checked = Some(Instant::now());
+        self.checking_update = true;
         let (tx, ctx) = (self.upd.0.clone(), ctx.clone());
         std::thread::spawn(move || {
-            match crate::update::latest() {
-                Ok(Some(r)) => {
-                    let _ = tx.send(Upd::Found(r));
-                    ctx.request_repaint();
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("ptlabel: update check: {e:#}"),
-            }
+            let msg = match crate::update::latest() {
+                Ok(Some(release)) => Upd::Found { release, manual },
+                Ok(None) => Upd::UpToDate { manual },
+                Err(e) => Upd::CheckFailed { err: format!("{e:#}"), manual },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
         });
     }
 
@@ -638,12 +675,32 @@ impl App {
         let msgs: Vec<_> = self.upd.1.try_iter().collect();
         for m in msgs {
             match m {
-                Upd::Found(r) => {
-                    if self.update.as_ref().is_none_or(|u| u.version != r.version) {
+                Upd::Found { release: r, manual } => {
+                    self.checking_update = false;
+                    self.update_status = Some((format!("PTLabel {} is available.", r.version), false));
+                    if manual || self.update.as_ref().is_none_or(|u| u.version != r.version) {
                         self.update_modal = true;
                         self.update_error = None;
                     }
                     self.update = Some(r);
+                }
+                Upd::UpToDate { manual } => {
+                    self.checking_update = false;
+                    let msg = format!("PTLabel {} is up to date.", env!("CARGO_PKG_VERSION"));
+                    self.update_status = Some((msg.clone(), false));
+                    if manual {
+                        self.info(msg);
+                    }
+                }
+                Upd::CheckFailed { err, manual } => {
+                    self.checking_update = false;
+                    if manual {
+                        let msg = format!("Update check failed: {err}");
+                        self.update_status = Some((msg.clone(), true));
+                        self.error(msg);
+                    } else {
+                        eprintln!("ptlabel: update check: {err}");
+                    }
                 }
                 // In place: open the new one and quit this one (the label is kept in the saved state).
                 Upd::Installed(Ok(app)) => {
@@ -749,9 +806,19 @@ impl App {
                     ui.hyperlink_to(RichText::new("Release notes on GitHub ↗").size(13.5), &r.html_url);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_install = is_dev_preview || crate::update::bundle().is_some();
                     let label = if self.updating { "Updating…" } else { "Update now" };
                     let primary = egui::Button::new(RichText::new(label).size(14.5).color(Color32::WHITE).strong()).fill(accent);
-                    if ui.add_enabled(!self.updating && !printing, primary).clicked() {
+                    let btn = ui
+                        .add_enabled(!self.updating && !printing && can_install, primary)
+                        .on_disabled_hover_text(if !can_install {
+                            "Download from GitHub Releases to update a local build"
+                        } else if printing {
+                            "Wait for the print queue to finish"
+                        } else {
+                            ""
+                        });
+                    if btn.clicked() {
                         install = true;
                     }
                     if ui.add_enabled(!self.updating, egui::Button::new(RichText::new("Later").size(14.5))).clicked() {
@@ -774,6 +841,185 @@ impl App {
             self.update_modal = false;
             #[cfg(feature = "dev")]
             self.dev.set_update_preview(false);
+        }
+    }
+
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        let accent = self.dev.cfg.accent();
+        let style = ctx.global_style();
+        let frame = egui::Frame::new()
+            .fill(style.visuals.panel_fill)
+            .stroke(style.visuals.window_stroke)
+            .corner_radius(10)
+            .inner_margin(egui::Margin::same(22));
+        let mut close = false;
+        let mut check_now = false;
+        let mut open_update = false;
+        let mut clear_recent = false;
+        let resp = egui::Modal::new(egui::Id::unique("settings")).frame(frame).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.label(RichText::new("Settings").strong().size(20.0));
+            ui.add_space(12.0);
+
+            // Appearance
+            ui.label(RichText::new("Appearance").strong().size(13.5));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Theme");
+                ui.add_space(8.0);
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for (mode, label) in [
+                    (ThemeMode::System, "System"),
+                    (ThemeMode::Light, "Light"),
+                    (ThemeMode::Dark, "Dark"),
+                ] {
+                    if ui
+                        .add(egui::Button::new(label).selected(self.p.theme == mode).min_size(egui::vec2(64.0, 28.0)))
+                        .clicked()
+                    {
+                        self.p.theme = mode;
+                    }
+                }
+            });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // Printers
+            ui.label(RichText::new("Printers").strong().size(13.5));
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.p.auto_connect, "Auto-connect to discovered printer on launch");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Default offline tape");
+                let cur_tape = Tape::tze(self.p.offline_tape)
+                    .map(|t| format!("{} mm", t.nominal_mm))
+                    .unwrap_or_else(|| format!("{} mm", self.p.offline_tape));
+                ComboBox::from_id_salt("settings_offline_tape")
+                    .selected_text(cur_tape)
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for w in TZE_WIDTHS {
+                            let label = Tape::tze(w).map(|t| format!("{} mm", t.nominal_mm)).unwrap_or_else(|| format!("{w} mm"));
+                            ui.selectable_value(&mut self.p.offline_tape, w, label);
+                        }
+                    });
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Saved Wi-Fi hosts").size(12.5).weak());
+            ui.add_space(4.0);
+            let mut remove_host: Option<usize> = None;
+            if self.p.hosts.is_empty() {
+                ui.label(RichText::new("None saved").size(12.5).weak());
+            } else {
+                for (i, h) in self.p.hosts.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(h).monospace());
+                        if ui.small_button("×").on_hover_text("Remove host").clicked() {
+                            remove_host = Some(i);
+                        }
+                    });
+                }
+            }
+            if let Some(i) = remove_host {
+                self.p.hosts.remove(i);
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let edit = ui.add(
+                    TextEdit::singleline(&mut self.settings_host_input)
+                        .desired_width(220.0)
+                        .hint_text("Printer IP or hostname…"),
+                );
+                let submit = (edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
+                    || ui.button("Add").clicked();
+                if submit {
+                    let h = self.settings_host_input.trim().to_string();
+                    if !h.is_empty() && !self.p.hosts.contains(&h) {
+                        self.p.hosts.push(h);
+                    }
+                    self.settings_host_input.clear();
+                }
+            });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // Updates
+            ui.label(RichText::new("Updates").strong().size(13.5));
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.p.auto_check_updates, "Check for updates automatically");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Installed: v{}", env!("CARGO_PKG_VERSION"))).monospace().weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.update.is_some() {
+                        if ui
+                            .add(egui::Button::new(RichText::new("View Update…").color(Color32::WHITE).strong()).fill(accent))
+                            .clicked()
+                        {
+                            open_update = true;
+                        }
+                    }
+                    if ui
+                        .add_enabled(!self.checking_update, egui::Button::new("Check for Updates…"))
+                        .clicked()
+                    {
+                        check_now = true;
+                    }
+                });
+            });
+            if self.checking_update {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Checking GitHub Releases…").size(12.5).weak());
+                });
+            } else if let Some((msg, is_err)) = &self.update_status {
+                ui.add_space(4.0);
+                let col = if *is_err { Color32::from_rgb(220, 60, 50) } else { ui.visuals().weak_text_color() };
+                ui.label(RichText::new(msg).size(12.5).color(col));
+            }
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // Workspace
+            ui.label(RichText::new("Workspace").strong().size(13.5));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let recent_label = format!("Clear Recent Files ({})", self.p.recent.len());
+                if ui.add_enabled(!self.p.recent.is_empty(), egui::Button::new(recent_label)).clicked() {
+                    clear_recent = true;
+                }
+                if ui.button("Reset Preview Height").clicked() {
+                    self.p.preview_height = 220.0;
+                }
+            });
+
+            ui.add_space(16.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("Done").size(14.0)).clicked() {
+                    close = true;
+                }
+            });
+        });
+
+        if clear_recent {
+            self.p.recent.clear();
+            self.refresh_recent();
+        }
+        if check_now {
+            self.manual_check_update(ctx);
+        }
+        if open_update {
+            self.settings_modal = false;
+            self.update_modal = true;
+        } else if close || resp.should_close() {
+            self.settings_modal = false;
         }
     }
 
@@ -2367,6 +2613,7 @@ impl App {
             (sc(Modifiers::COMMAND, Key::O), MenuCmd::Open),
             (sc(Modifiers::COMMAND, Key::N), MenuCmd::New),
             (sc(Modifiers::COMMAND, Key::P), MenuCmd::Print),
+            (sc(Modifiers::COMMAND, Key::Comma), MenuCmd::Settings),
         ];
         let mut cmds: Vec<MenuCmd> = self.menu_rx.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
         for (k, c) in keys {
@@ -2440,6 +2687,8 @@ impl App {
             MenuCmd::SaveAs => self.save(ctx, true),
             MenuCmd::ExportPng => self.export_png(ctx),
             MenuCmd::Print => self.print(),
+            MenuCmd::Settings => self.settings_modal = true,
+            MenuCmd::CheckUpdates => self.manual_check_update(ctx),
         }
     }
 
@@ -2502,6 +2751,17 @@ impl App {
                 }
                 if ui.add(egui::Button::new("Redo").shortcut_text("Ctrl+Y")).clicked() {
                     cmd = Some(MenuCmd::Redo);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Settings…").shortcut_text("Ctrl+,")).clicked() {
+                    cmd = Some(MenuCmd::Settings);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("Check for Updates…").clicked() {
+                    cmd = Some(MenuCmd::CheckUpdates);
                     ui.close();
                 }
             });
@@ -3629,6 +3889,14 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.dev.poll(&ctx);
         self.dev.apply(&ctx);
+        if self.screenshot_path.is_none() && self.dev.cfg.theme == ThemeMode::System {
+            let pref = match self.p.theme {
+                ThemeMode::System => egui::ThemePreference::System,
+                ThemeMode::Light => egui::ThemePreference::Light,
+                ThemeMode::Dark => egui::ThemePreference::Dark,
+            };
+            ctx.set_theme(pref);
+        }
         self.pump();
         self.pump_dialogs();
         self.handle_dropped_files(&ctx);
@@ -3702,6 +3970,9 @@ impl eframe::App for App {
                 }
                 self.update_modal = true;
             }
+        }
+        if self.settings_modal {
+            self.settings_dialog(&ctx);
         }
         if self.update_modal {
             self.update_dialog(&ctx);

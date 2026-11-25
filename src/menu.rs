@@ -1,7 +1,7 @@
-//! Native macOS File menu (New / Open / Save / Save As / Print), inserted into the
-//! menu bar next to the app menu. Clicks and their key equivalents arrive as
-//! `MenuCmd`s on a channel and wake the UI.
-//! Also File › Open Recent (filled by `set_recent`) and an Edit menu with Undo / Redo.
+//! Native macOS application menu items (Check for Updates…, Settings… ⌘,),
+//! File menu (New / Open / Open Recent / Save / Save As / Export PNG / Print),
+//! and Edit menu (Undo / Redo). Clicks and key equivalents arrive as `MenuCmd`s
+//! on a channel and wake the UI.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MenuCmd {
@@ -17,6 +17,8 @@ pub enum MenuCmd {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     OpenRecent,
     ClearRecent,
+    Settings,
+    CheckUpdates,
 }
 
 #[cfg(target_os = "macos")]
@@ -35,13 +37,15 @@ mod imp {
 
     fn from_tag(t: isize) -> Option<MenuCmd> {
         use MenuCmd::*;
-        [New, Open, Save, SaveAs, ExportPng, Print].into_iter().find(|c| *c as isize == t)
+        [New, Open, Save, SaveAs, ExportPng, Print, Settings, CheckUpdates]
+            .into_iter()
+            .find(|c| *c as isize == t)
     }
 
     #[test]
     fn tags_round_trip() {
         use MenuCmd::*;
-        for c in [New, Open, Save, SaveAs, Print] {
+        for c in [New, Open, Save, SaveAs, ExportPng, Print, Settings, CheckUpdates] {
             assert_eq!(from_tag(c as isize), Some(c));
         }
         assert_eq!(from_tag(0), None); // NSMenuItem's default tag
@@ -76,6 +80,20 @@ mod imp {
             // SAFETY: plain NSObject init.
             unsafe { msg_send![super(this), init] }
         };
+        // App menu (PTLabel › Check for Updates…, Settings… ⌘,) right after About PTLabel.
+        if let Some(app_menu) = main.itemAtIndex(0).and_then(|it| it.submenu()) {
+            let idx = app_menu.numberOfItems().min(1);
+            app_menu.insertItem_atIndex(
+                &item(mtm, &target, "Check for Updates…", "", MenuCmd::CheckUpdates as isize),
+                idx,
+            );
+            app_menu.insertItem_atIndex(&NSMenuItem::separatorItem(mtm), idx + 1);
+            app_menu.insertItem_atIndex(
+                &item(mtm, &target, "Settings…", ",", MenuCmd::Settings as isize),
+                idx + 2,
+            );
+            app_menu.insertItem_atIndex(&NSMenuItem::separatorItem(mtm), idx + 3);
+        }
         let file = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("File"));
         // Key equivalents use ⌘; a capital letter adds ⇧.
         let entries = [
