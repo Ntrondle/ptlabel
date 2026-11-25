@@ -2,9 +2,9 @@
 //! print queue. Jobs are snapshots taken when Print is pressed; the worker starts
 //! the next one whenever the printer reports ready (tape in, no error, idle).
 
-use crate::job::{PrintJob, run_job};
+use crate::job::{PrintJob, run_feed_cut, run_job};
 use crate::label::render::Renderer;
-use crate::proto::Status;
+use crate::proto::{Caps, Status};
 use crate::transport::{PrinterId, Transport};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use std::collections::VecDeque;
@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 pub enum Cmd {
     /// Re-read status now (and start the next queued job if ready).
     Refresh,
+    /// Feed out and cut the last label waiting inside the printer from chain printing.
+    FeedCut(Caps),
     Close,
 }
 
@@ -23,8 +25,10 @@ pub enum Event {
     Offline(String),
     Started { id: u64, title: String, total: Option<u32> },
     Progress { id: u64, done: u32, total: Option<u32> },
-    Done { id: u64, printed: u32 },
+    Done { id: u64, printed: u32, chained: bool },
     Failed { id: u64, error: String },
+    CutDone,
+    CutFailed(String),
 }
 
 pub struct Queued {
@@ -78,6 +82,13 @@ impl PrinterHandle {
                     let wait = next_poll.saturating_duration_since(Instant::now());
                     match crx.recv_timeout(wait) {
                         Ok(Cmd::Refresh) => next_poll = Instant::now(),
+                        Ok(Cmd::FeedCut(caps)) => {
+                            match run_feed_cut(t.as_mut(), caps) {
+                                Ok(()) => send(Event::CutDone),
+                                Err(e) => send(Event::CutFailed(format!("{e:#}"))),
+                            }
+                            next_poll = Instant::now();
+                        }
                         Ok(Cmd::Close) | Err(RecvTimeoutError::Disconnected) => {
                             t.close();
                             break;
@@ -108,12 +119,17 @@ impl PrinterHandle {
                             // Reset before taking the job, so a Stop from Drop can't be lost in between.
                             wstop.store(false, Ordering::SeqCst);
                             let Some(q) = wqueue.lock().unwrap().pop_front() else { continue };
+                            let chained_opts = q.job.settings.opts.chain && !q.job.settings.opts.special_tape;
                             send(Event::Started { id: q.id, title: q.title.clone(), total: q.total });
                             let r = run_job(t.as_mut(), &renderer, &q.job, &wstop, &mut |done, total| {
                                 send(Event::Progress { id: q.id, done, total })
                             });
                             match r {
-                                Ok(printed) => send(Event::Done { id: q.id, printed }),
+                                Ok(printed) => send(Event::Done {
+                                    id: q.id,
+                                    printed,
+                                    chained: printed > 0 && chained_opts,
+                                }),
                                 Err(e) => send(Event::Failed { id: q.id, error: format!("{e:#}") }),
                             }
                             // Re-check right away; the next job starts as soon as the printer is idle.
@@ -150,6 +166,11 @@ impl PrinterHandle {
 
     pub fn refresh(&self) {
         let _ = self.tx.send(Cmd::Refresh);
+    }
+
+    /// Feed out and cut the last label held in the printer after chain printing.
+    pub fn feed_and_cut(&self, caps: Caps) {
+        let _ = self.tx.send(Cmd::FeedCut(caps));
     }
 
     /// Graceful stop of the running job: the next label is the last one (fed + cut).
@@ -258,7 +279,7 @@ mod tests {
         while order.len() < 4 && Instant::now() < deadline {
             match h.rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Event::Started { id, .. }) => order.push(format!("start{id}")),
-                Ok(Event::Done { id, printed }) => order.push(format!("done{id}x{printed}")),
+                Ok(Event::Done { id, printed, .. }) => order.push(format!("done{id}x{printed}")),
                 Ok(Event::Failed { error, .. }) => panic!("{error}"),
                 _ => {}
             }
@@ -319,7 +340,7 @@ mod tests {
         while ev.len() < 4 && Instant::now() < deadline {
             match h.rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Event::Started { id, .. }) => ev.push(format!("start{id}")),
-                Ok(Event::Done { id, printed }) => ev.push(format!("done{id}x{printed}")),
+                Ok(Event::Done { id, printed, .. }) => ev.push(format!("done{id}x{printed}")),
                 Ok(Event::Failed { id, error }) => ev.push(format!("failed{id}: {error}")),
                 _ => {}
             }
@@ -383,5 +404,42 @@ mod tests {
         assert!(h.rx.try_iter().next().is_none(), "unchanged polls send nothing");
         assert_eq!(seen, vec![true, false]);
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn chain_job_reports_chained_and_feed_cut_finishes_cleanly() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let mut h = spawn_mock(&log, None);
+        let mut j = job(1);
+        j.settings.opts.chain = true;
+        h.enqueue(j, "Chained".into(), Some(1));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut chained = false;
+        while Instant::now() < deadline {
+            if let Ok(Event::Done { chained: c, .. }) = h.rx.recv_timeout(Duration::from_millis(200)) {
+                chained = c;
+                break;
+            }
+        }
+        assert!(chained, "chained job must report chained = true");
+
+        h.feed_and_cut(Caps::default());
+        let mut cut_done = false;
+        while Instant::now() < deadline {
+            match h.rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Event::CutDone) => {
+                    cut_done = true;
+                    break;
+                }
+                Ok(Event::CutFailed(e)) => panic!("cut failed: {e}"),
+                _ => {}
+            }
+        }
+        assert!(cut_done);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["begin", "page-last", "finish", "begin", "page-last", "finish"]
+        );
     }
 }

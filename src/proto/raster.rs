@@ -178,6 +178,25 @@ pub fn encode_page(
     out.push(if last { 0x1A } else { 0x0C });
 }
 
+/// Encode a ~26 mm blank push-out page with `chain: true` so the last chained label
+/// advances past the cutter (~24.5 mm from the print head) and is cut cleanly without
+/// feeding and cutting an extra white blank label afterwards.
+pub fn encode_feed_cut(out: &mut Vec<u8>, tape: &Tape, caps: Caps) {
+    // 2 mm lead (14 dots) + 156 blank lines (22.0 mm) + 2 mm trail (14 dots) = 26.0 mm (> 24.5 mm cutter offset).
+    let bm = Bitmap::new(156, tape.print_pins as usize);
+    let opts = PageOpts {
+        auto_cut: true,
+        half_cut: false,
+        chain: true,
+        cut_every: 1,
+        mirror: false,
+        high_res: false,
+        special_tape: false,
+        margin_mm: 2.0,
+    };
+    encode_page(out, &bm, tape, &opts, caps, 0, true);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +343,23 @@ mod tests {
         assert_eq!(term, 0x0C);
         assert_eq!(u128::from_be_bytes(lines[0]), (1 << 116) | (1 << 11));
         assert!(lines[1..].iter().all(|l| *l == [0; LINE_BYTES]));
+    }
+
+    #[test]
+    fn feed_cut_pushes_chained_label_past_cutter_without_extra_blank() {
+        let tape = Tape::tze(12).unwrap();
+        let mut out = Vec::new();
+        encode_feed_cut(&mut out, &tape, Caps::default());
+        assert_eq!(&out[..4], &[0x1B, 0x69, 0x61, 0x01]);
+        let z = out.windows(3).position(|w| w == [0x1B, 0x69, 0x7A]).unwrap();
+        assert_eq!(u32::from_le_bytes(out[z + 7..z + 11].try_into().unwrap()), 156);
+        let m = out.windows(3).position(|w| w == [0x1B, 0x69, 0x4D]).unwrap();
+        assert_eq!(out[m + 3], 0x40); // auto-cut on
+        let k = out.windows(3).position(|w| w == [0x1B, 0x69, 0x4B]).unwrap();
+        assert_eq!(out[k + 3], 0x00); // chain on: stops after cutting the previous label, no extra blank cut
+        let (lines, term) = decode_raster(&out);
+        assert_eq!(lines.len(), 156);
+        assert!(lines.iter().all(|l| *l == [0; LINE_BYTES]));
+        assert_eq!(term, 0x1A);
     }
 }

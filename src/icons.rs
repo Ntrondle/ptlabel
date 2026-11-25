@@ -19,6 +19,7 @@ pub enum Icon {
     AlignLeft,
     AlignCenter,
     AlignRight,
+    Scissors,
 }
 
 impl Icon {
@@ -138,6 +139,18 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, col: Color32) {
                 p.rect_filled(rect(x0, cy - h * 0.5, x0 + w, cy + h * 0.5), rad, col);
             }
         }
+        Icon::Scissors => {
+            let blade = Stroke::new((side / 9.5).max(1.8), col);
+            let ring = Stroke::new((side / 10.0).max(1.6), col);
+            // Finger rings on the left
+            p.circle_stroke(at(0.24, 0.27), side * 0.15, ring);
+            p.circle_stroke(at(0.24, 0.73), side * 0.15, ring);
+            // Crossed blades extending to the right
+            p.line_segment([at(0.36, 0.34), at(0.90, 0.76)], blade);
+            p.line_segment([at(0.36, 0.66), at(0.90, 0.24)], blade);
+            // Center pivot screw
+            p.circle_filled(at(0.55, 0.50), side * 0.055, col);
+        }
     }
 }
 
@@ -210,9 +223,10 @@ pub fn button(ui: &mut Ui, icon: Icon, text: &str) -> Response {
 /// Compact square toggle button with a centred vector icon (used for text alignment bars).
 pub fn toggle_icon(ui: &mut Ui, selected: bool, icon: Icon, tooltip: &str) -> Response {
     let id = egui::IdSalt::new(icon);
+    let h = ui.spacing().interact_size.y.max(28.0);
     let out = egui::Button::new(egui::Atom::custom(id, vec2(15.0 * icon.aspect(), 15.0)))
         .selected(selected)
-        .min_size(vec2(30.0, 28.0))
+        .min_size(vec2(30.0, h))
         .atom_ui(ui);
     if let Some(r) = out.rect(id) {
         let col = ui.style().interact_selectable(&out.response, selected).text_color();

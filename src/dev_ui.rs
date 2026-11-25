@@ -131,6 +131,12 @@ impl UiConfig {
             s.spacing.item_spacing = egui::vec2(self.item_spacing_x, self.item_spacing_y);
             s.spacing.button_padding = egui::vec2(self.button_padding_x, self.button_padding_y);
             s.spacing.interact_size.y = self.interact_height;
+            let mut scroll = egui::style::ScrollStyle::solid();
+            scroll.bar_width = 8.0;
+            scroll.bar_inner_margin = 6.0;
+            scroll.bar_outer_margin = 2.0;
+            scroll.handle_min_length = 28.0;
+            s.spacing.scroll = scroll;
         });
         match self.theme {
             ThemeMode::System => {}

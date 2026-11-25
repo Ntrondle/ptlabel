@@ -2,6 +2,16 @@
 
 All notable changes to PTLabel are documented in this file.
 
+## [2.4.0] - 2026-11-25
+
+### Chain Printing & Cutting
+- **Feed & Cut button for Chain printing:** When **Chain printing** is enabled and a finished label is sitting inside the printer waiting for the next job, a square scissors **Cut** button appears directly beside **Print**. Clicking it feeds out and cuts the waiting label cleanly without ejecting an extra white blank label, then hides automatically until the next chained print.
+
+### Workspace & UI
+- **Resizable live preview:** Drag the grip handle below the preview box to resize it (persisted across sessions), or double-click to toggle compact mode. Shrinking the preview dynamically expands the Excel table so large spreadsheets show more rows at once.
+- **Dedicated scroll pill rail:** Switched scrollbars to a dedicated non-overlapping right-hand track across the editor and Excel table so scroll pills never cover buttons, card borders, or cells.
+- **Cleaner toolbar & Print panel footer:** Moved the `Sequence:` / `Time:` / `Columns:` placeholder reminder into the empty space at the bottom of the Print panel (right above the `⌘P / ⌘S / ⌘O / ⌘N` shortcuts) so the editor extends all the way to the bottom edge; centered and balanced the `LENGTH` / `ADD` section labels at matching `32 px` height; flattened `align_buttons` layout and matched button heights across toolbar and text rows.
+
 ## [2.3.0] - 2026-11-25
 
 ### Spreadsheet & Excel Selection

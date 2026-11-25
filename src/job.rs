@@ -1,7 +1,7 @@
 use crate::label::render::{Renderer, label_length_mm};
 use crate::data::Record;
 use crate::label::{Label, SequenceBlock, Vars};
-use crate::proto::raster::encode_page;
+use crate::proto::raster::{encode_feed_cut, encode_page};
 use crate::proto::{Bitmap, Caps, PageOpts};
 use crate::transport::Transport;
 use anyhow::{Context, Result, bail};
@@ -173,6 +173,27 @@ pub fn run_job(
         Ok(i)
     };
     let res = run();
+    if res.is_err() {
+        t.abort();
+    }
+    res
+}
+
+/// Feed out and cut the last label held inside the printer from chain printing.
+pub fn run_feed_cut(t: &mut dyn Transport, caps: Caps) -> Result<()> {
+    let st = t.begin()?;
+    let errs = st.errors();
+    if !errs.is_empty() {
+        t.abort();
+        bail!("{}", errs.join(", "));
+    }
+    let Some(tape) = st.tape() else {
+        t.abort();
+        bail!("no tape loaded");
+    };
+    let mut buf = Vec::with_capacity(48);
+    encode_feed_cut(&mut buf, &tape, caps);
+    let res = t.send_page(&buf, 30.0).and_then(|()| t.finish());
     if res.is_err() {
         t.abort();
     }

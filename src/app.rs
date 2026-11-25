@@ -80,6 +80,8 @@ struct Persist {
     recent: Vec<String>,
     /// Selected spreadsheet rows (indices into the loaded table).
     sel_rows: Vec<usize>,
+    /// User-resizable height of the live label preview box (logical pixels).
+    preview_height: f32,
 }
 
 impl Default for Persist {
@@ -94,6 +96,7 @@ impl Default for Persist {
             doc_path: None,
             recent: vec![],
             sel_rows: vec![],
+            preview_height: 220.0,
         }
     }
 }
@@ -212,6 +215,10 @@ pub struct App {
     live_tape: Option<Tape>,
     job: Option<Running>,
     stopping: bool,
+    /// True when the last completed job was printed in chain mode and still sits inside the printer uncut.
+    chain_pending: bool,
+    /// True while a manual feed-and-cut command is running.
+    cutting: bool,
     msg: Option<(String, bool, Instant)>,
     preview: Option<Preview>,
     /// Preview render running on a worker thread.
@@ -334,6 +341,12 @@ impl App {
             s.spacing.item_spacing = egui::vec2(8.0, 6.0);
             s.spacing.button_padding = egui::vec2(10.0, 6.0);
             s.spacing.interact_size.y = 28.0;
+            let mut scroll = egui::style::ScrollStyle::solid();
+            scroll.bar_width = 8.0;
+            scroll.bar_inner_margin = 6.0;
+            scroll.bar_outer_margin = 2.0;
+            scroll.handle_min_length = 28.0;
+            s.spacing.scroll = scroll;
         });
         let history = History::new(p.label.clone());
         let mut app = Self {
@@ -347,6 +360,8 @@ impl App {
             live_tape: None,
             job: None,
             stopping: false,
+            chain_pending: false,
+            cutting: false,
             msg: None,
             preview: None,
             preview_job: None,
@@ -417,6 +432,8 @@ impl App {
         self.conn = Conn::Connecting;
         self.live_tape = None;
         self.job = None;
+        self.chain_pending = false;
+        self.cutting = false;
         self.p.printer = Some(id);
         self.p.auto_connect = true;
     }
@@ -445,6 +462,8 @@ impl App {
         self.conn = Conn::None;
         self.live_tape = None;
         self.job = None;
+        self.chain_pending = false;
+        self.cutting = false;
         self.p.printer = None;
         self.p.auto_connect = false;
     }
@@ -503,6 +522,7 @@ impl App {
                 Event::Status(s) => {
                     let t = s.tape();
                     if self.live_tape.is_some() && t.is_none() {
+                        self.chain_pending = false;
                         self.info("Tape removed".into());
                     }
                     self.live_tape = t;
@@ -534,15 +554,25 @@ impl App {
                         r.total = total;
                     }
                 }
-                Event::Done { id, printed } => {
+                Event::Done { id, printed, chained } => {
                     let title = self.job.take().filter(|r| r.id == id).map(|r| r.title).unwrap_or_default();
                     self.stopping = false;
+                    self.chain_pending = chained;
                     self.info(format!("Printed {} · {title}", count_text(Some(printed))));
                 }
                 Event::Failed { id, error } => {
                     let title = self.job.take().filter(|r| r.id == id).map(|r| r.title).unwrap_or_default();
                     self.stopping = false;
                     self.error(format!("Print failed ({title}): {error}"));
+                }
+                Event::CutDone => {
+                    self.chain_pending = false;
+                    self.cutting = false;
+                    self.info("Fed & cut last chained label".into());
+                }
+                Event::CutFailed(error) => {
+                    self.cutting = false;
+                    self.error(format!("Feed & cut failed: {error}"));
                 }
             }
         }
@@ -1024,7 +1054,7 @@ impl App {
         Pager::new(&self.p.label, &self.p.settings, row.into_iter().collect()).record_vars(k as u64)
     }
 
-    fn data_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+    fn data_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, editor_avail_h: f32) {
         let Some(src) = self.p.label.data.clone() else { return };
         enum DAct {
             Change,
@@ -1096,6 +1126,14 @@ impl App {
 
                 if let Some(t) = &self.table {
                     let mut tbl_act = TableAction::None;
+                    let reserve_for_blocks = if self.p.label.blocks.is_empty()
+                        || self.collapsed.iter().take(self.p.label.blocks.len()).all(|&c| c)
+                    {
+                        90.0
+                    } else {
+                        150.0
+                    };
+                    let table_max_h = (editor_avail_h - reserve_for_blocks).max(self.dev.cfg.table_max_height);
                     table_ui(
                         ui,
                         t,
@@ -1107,6 +1145,7 @@ impl App {
                         &mut self.table_drag,
                         &self.picked_fields,
                         &self.dev.cfg,
+                        table_max_h,
                         &mut tbl_act,
                     );
                     match tbl_act {
@@ -1591,36 +1630,81 @@ impl App {
         };
         let label = if busy { format!("Add to queue · {}", count_text(total)) } else { label };
         let enabled = self.handle.is_some();
+        let show_cut = self.p.settings.opts.chain && self.chain_pending;
         let icon_id = egui::IdSalt::new("print-icon");
         let text_rt = if enabled {
             RichText::new(label).size(20.0).strong().color(Color32::WHITE)
         } else {
             RichText::new(label).size(20.0).strong()
         };
-        let mut btn = egui::Button::new((egui::Atom::custom(icon_id, egui::Vec2::splat(28.0)), text_rt))
-            .min_size(egui::vec2(ui.available_width(), 58.0));
-        if enabled {
-            btn = btn.fill(self.dev.cfg.accent());
-        }
         ui.add_space(6.0);
-        let out = ui.add_enabled_ui(enabled, |ui| btn.atom_ui(ui)).inner;
-        if let Some(r) = out.rect(icon_id) {
-            let col = if enabled { Color32::WHITE } else { ui.style().interact(&out.response).text_color() };
-            icons::paint(ui.painter(), r, Icon::Printer, col);
-        }
-        #[cfg(target_os = "macos")]
-        const PRINT_HINT: &str = "⌘P · jobs queue up while printing";
-        #[cfg(not(target_os = "macos"))]
-        const PRINT_HINT: &str = "Ctrl+P · jobs queue up while printing";
-        if out.response.on_hover_text(PRINT_HINT).clicked() {
+        let mut do_print = false;
+        let mut do_cut = false;
+        ui.horizontal(|ui| {
+            let cut_w = 58.0;
+            let gap = ui.spacing().item_spacing.x;
+            let print_w = if show_cut { (ui.available_width() - cut_w - gap).max(120.0) } else { ui.available_width() };
+            let mut btn = egui::Button::new((egui::Atom::custom(icon_id, egui::Vec2::splat(28.0)), text_rt))
+                .min_size(egui::vec2(print_w, 58.0));
+            if enabled {
+                btn = btn.fill(self.dev.cfg.accent());
+            }
+            let out = ui.add_enabled_ui(enabled, |ui| btn.atom_ui(ui)).inner;
+            if let Some(r) = out.rect(icon_id) {
+                let col = if enabled { Color32::WHITE } else { ui.style().interact(&out.response).text_color() };
+                icons::paint(ui.painter(), r, Icon::Printer, col);
+            }
+            #[cfg(target_os = "macos")]
+            const PRINT_HINT: &str = "⌘P · jobs queue up while printing";
+            #[cfg(not(target_os = "macos"))]
+            const PRINT_HINT: &str = "Ctrl+P · jobs queue up while printing";
+            if out.response.on_hover_text(PRINT_HINT).clicked() {
+                do_print = true;
+            }
+            if show_cut {
+                let cut_id = egui::IdSalt::new("cut-chain-icon");
+                let wait_reason = self.waiting_reason();
+                let can_cut = enabled && !busy && !self.cutting && wait_reason.is_none();
+                let cut_btn = egui::Button::new(egui::Atom::custom(cut_id, egui::Vec2::splat(26.0)))
+                    .min_size(egui::vec2(cut_w, 58.0));
+                let cut_out = ui.add_enabled_ui(can_cut, |ui| cut_btn.atom_ui(ui)).inner;
+                if let Some(r) = cut_out.rect(cut_id) {
+                    let col = ui.style().interact(&cut_out.response).text_color();
+                    icons::paint(ui.painter(), r, Icon::Scissors, col);
+                }
+                let tip = if self.cutting {
+                    "Feeding & cutting the last chained label…".to_string()
+                } else if let Some(w) = wait_reason {
+                    format!("Feed & cut unavailable: {w}")
+                } else {
+                    "Feed & cut the last chained label waiting in the printer".to_string()
+                };
+                if cut_out.response.on_hover_text(&tip).on_disabled_hover_text(&tip).clicked() {
+                    do_cut = true;
+                }
+            }
+        });
+        if do_print {
             self.print();
+        }
+        if do_cut {
+            if let Some(h) = &self.handle {
+                h.feed_and_cut(caps);
+                self.cutting = true;
+            }
         }
         if self.handle.is_none() {
             ui.weak("Select a printer");
-        } else if has_data && n_sel == 0 {
-            ui.weak(format!("Select {units} in the spreadsheet table"));
         } else if let Some(w) = self.waiting_reason() {
             ui.weak(format!("{w}. Jobs wait and print automatically."));
+        } else if show_cut {
+            ui.weak(if self.cutting {
+                "Feeding & cutting last label…"
+            } else {
+                "Last chained label waiting — print next or cut"
+            });
+        } else if has_data && n_sel == 0 {
+            ui.weak(format!("Select {units} in the spreadsheet table"));
         }
         ui.add_space(8.0);
 
@@ -1681,7 +1765,7 @@ impl App {
             ui.add_enabled(en, egui::Label::new("labels"));
         });
         ui.checkbox(&mut o.chain, "Chain printing")
-            .on_hover_text("Don't feed and cut after the last label. Saves ~25 mm of tape; it's cut when the next job starts.");
+            .on_hover_text("Don't feed and cut after the last label (saves ~25 mm of tape). Cut when the next job starts, or press the Cut button next to Print to feed & cut the last label.");
         ui.checkbox(&mut o.special_tape, "Never cut (fabric / special tape)");
 
         ui.separator();
@@ -1741,44 +1825,99 @@ impl App {
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
         let tape = self.tape();
         let Some(pv) = &self.preview else { return };
+        let tex_id = pv.tex.id();
+        let [w, h] = pv.phys;
+        let len_mm = pv.len_mm;
+        let overflow = pv.overflow;
+        let warnings = pv.warnings.clone();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{:.1} mm", pv.len_mm)).strong().size(15.0));
+            ui.label(RichText::new(format!("{len_mm:.1} mm")).strong().size(15.0));
             ui.label(format!("on {}", tape.describe()));
             ui.weak(format!("· print area {:.1} mm", tape.print_pins as f32 * 25.4 / 180.0));
             if self.live_tape.is_none() {
                 ui.weak("· design only");
             }
         });
-        for w in &pv.warnings {
-            ui.colored_label(Color32::from_rgb(220, 60, 50), w);
+        for warn in &warnings {
+            ui.colored_label(Color32::from_rgb(220, 60, 50), warn);
         }
-        if pv.overflow {
+        if overflow {
             ui.colored_label(Color32::from_rgb(230, 150, 20), "Content is longer than the fixed length; the label will be longer.");
         }
-        let [w, h] = pv.phys;
-        let avail = ui.available_width() - 24.0;
-        let scale = (avail / w).min(self.dev.cfg.preview_max_height / h).clamp(0.35, 3.0);
+        let min_h = 48.0_f32;
+        let max_h = (ui.ctx().content_rect().height() * 0.55).clamp(160.0, 480.0);
+        let box_h = self.p.preview_height.clamp(min_h, max_h);
+        let pad_y: f32 = if box_h < 76.0 { 4.0 } else { 10.0 };
+        let inner_h = (box_h - 2.0 * pad_y).max(20.0);
+        let avail_w = (ui.available_width() - 24.0).max(40.0);
+        let scale = (avail_w / w).min(inner_h / h).clamp(0.12, 4.0);
         let size = Vec2::new(w, h) * scale;
         egui::Frame::new()
             .fill(ui.visuals().extreme_bg_color)
             .corner_radius(6.0)
-            .inner_margin(12.0)
+            .inner_margin(egui::Margin::symmetric(12, pad_y as i8))
             .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.set_min_height(inner_h);
+                ui.set_max_height(inner_h);
                 egui::ScrollArea::horizontal().id_salt("pv").show(ui, |ui| {
+                    let top_pad = ((inner_h - size.y) * 0.5).max(0.0);
                     ui.vertical_centered(|ui| {
-                        let img = egui::Image::from_texture((pv.tex.id(), size)).corner_radius(2.0);
+                        if top_pad > 0.5 {
+                            ui.add_space(top_pad);
+                        }
+                        let img = egui::Image::from_texture((tex_id, size)).corner_radius(2.0);
                         ui.add(img).on_hover_text("Edges are the cut lines");
                     });
                 });
             });
+
+        // Draggable splitter handle to resize the preview height (double-click toggles compact).
+        let (handle_rect, handle_resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 12.0),
+            egui::Sense::click_and_drag(),
+        );
+        let active = handle_resp.hovered() || handle_resp.dragged();
+        if active {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if handle_resp.dragged() {
+            self.p.preview_height = (box_h + handle_resp.drag_delta().y).clamp(min_h, max_h);
+        }
+        if handle_resp.double_clicked() {
+            self.p.preview_height = if box_h > 110.0 {
+                72.0
+            } else {
+                self.dev.cfg.preview_max_height.clamp(min_h, max_h)
+            };
+        }
+        let p = ui.painter();
+        let line_y = handle_rect.center().y;
+        let line_col = if active {
+            self.dev.cfg.accent().gamma_multiply(0.55)
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.45)
+        };
+        p.line_segment(
+            [egui::pos2(handle_rect.min.x, line_y), egui::pos2(handle_rect.max.x, line_y)],
+            (1.0, line_col),
+        );
+        let pill = egui::Rect::from_center_size(handle_rect.center(), egui::vec2(38.0, 4.0));
+        let pill_col = if active {
+            self.dev.cfg.accent()
+        } else {
+            ui.visuals().weak_text_color().gamma_multiply(0.55)
+        };
+        p.rect_filled(pill, 2.0, pill_col);
+        handle_resp.on_hover_text("Drag to resize preview · Double-click to toggle compact size");
     }
 
     fn label_options(&mut self, ui: &mut egui::Ui) {
         let l = &mut self.p.label;
         let mut popup_open = false;
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().interact_size.y = 28.0;
-            section_label(ui, "LENGTH", 28.0);
+            ui.spacing_mut().interact_size.y = 32.0;
+            section_label(ui, "LENGTH", 32.0);
             ui.separator();
             egui::Frame::new()
                 .fill(ui.visuals().faint_bg_color)
@@ -1788,7 +1927,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.spacing_mut().interact_size.y = 24.0;
+                        ui.spacing_mut().interact_size.y = 26.0;
                         ui.selectable_value(&mut l.fixed_length, false, "Auto");
                         ui.selectable_value(&mut l.fixed_length, true, "Fixed");
                     });
@@ -1849,7 +1988,7 @@ impl App {
                     })
                     .response
                     .on_hover_text("Click to enter a custom length or pick a preset");
-                align_buttons(ui, &mut l.align);
+                align_buttons(ui, &mut l.align, "Align label");
             }
             ui.separator();
             ui.label(RichText::new("Gap").weak());
@@ -2041,19 +2180,19 @@ impl App {
         }
     }
 
-    fn status_left(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().interact_size.y = 0.0;
-        ui.spacing_mut().item_spacing.y = 1.0;
-        if let Some((m, err, t)) = &self.msg
-            && (t.elapsed().as_secs() < 12 || *err)
-        {
-            let c = if *err { Color32::from_rgb(220, 60, 50) } else { ui.visuals().text_color() };
-            ui.colored_label(c, RichText::new(m).size(12.0));
-            if !*err {
-                // Hide it on time even if nothing else repaints (idle status polls don't).
-                ui.ctx().request_repaint_after(Duration::from_secs(12).saturating_sub(t.elapsed()));
-            }
+    fn active_msg(&self) -> Option<(&str, bool, Duration)> {
+        let (m, err, t) = self.msg.as_ref()?;
+        let elapsed = t.elapsed();
+        if *err || elapsed.as_secs() < 12 {
+            Some((m.as_str(), *err, Duration::from_secs(12).saturating_sub(elapsed)))
+        } else {
+            None
         }
+    }
+
+    fn placeholders_ui(&self, ui: &mut egui::Ui) {
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.spacing_mut().item_spacing.y = 2.0;
         let seq_count = self.p.label.sequences().count();
         let seq_hints = (0..seq_count.max(1)).map(sequence_placeholder).collect::<Vec<_>>().join("  ");
         ui.horizontal_wrapped(|ui| {
@@ -2411,31 +2550,31 @@ const LENGTH_PRESETS: [(&str, f32); 5] = [
     ("50 ml Falcon, along the side", 60.0),
 ];
 
-/// Fixed-width muted uppercase section label so toolbar row titles read clearly as headers, not buttons.
+/// Fixed-width muted uppercase section label centered in its slot so toolbar row titles align cleanly.
 fn section_label(ui: &mut egui::Ui, title: &str, row_h: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, row_h), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(58.0, row_h), egui::Sense::hover());
     ui.painter().text(
-        egui::pos2(rect.min.x + 2.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
+        egui::pos2(rect.center().x, rect.center().y + 0.5),
+        egui::Align2::CENTER_CENTER,
         title,
-        FontId::new(10.5, egui::FontFamily::Name("bold".into())),
+        FontId::new(11.5, egui::FontFamily::Name("bold".into())),
         ui.visuals().weak_text_color(),
     );
 }
 
-fn align_buttons(ui: &mut egui::Ui, a: &mut Align) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 3.0;
-        if icons::toggle_icon(ui, *a == Align::Left, Icon::AlignLeft, "Align left").clicked() {
-            *a = Align::Left;
-        }
-        if icons::toggle_icon(ui, *a == Align::Center, Icon::AlignCenter, "Align center").clicked() {
-            *a = Align::Center;
-        }
-        if icons::toggle_icon(ui, *a == Align::Right, Icon::AlignRight, "Align right").clicked() {
-            *a = Align::Right;
-        }
-    });
+fn align_buttons(ui: &mut egui::Ui, a: &mut Align, prefix: &str) {
+    let prev = ui.spacing().item_spacing.x;
+    ui.spacing_mut().item_spacing.x = 3.0;
+    if icons::toggle_icon(ui, *a == Align::Left, Icon::AlignLeft, &format!("{prefix} left")).clicked() {
+        *a = Align::Left;
+    }
+    if icons::toggle_icon(ui, *a == Align::Center, Icon::AlignCenter, &format!("{prefix} center")).clicked() {
+        *a = Align::Center;
+    }
+    if icons::toggle_icon(ui, *a == Align::Right, Icon::AlignRight, &format!("{prefix} right")).clicked() {
+        *a = Align::Right;
+    }
+    ui.spacing_mut().item_spacing.x = prev;
 }
 
 /// Red zigzag under a misspelled word, like Word/Pages.
@@ -2612,7 +2751,7 @@ fn style_row(ui: &mut egui::Ui, i: usize, t: &mut TextBlock, fonts: &[String], f
         ui.toggle_value(&mut t.italic, RichText::new(" I ").italics());
         ui.toggle_value(&mut t.underline, RichText::new(" U ").underline());
         ui.separator();
-        align_buttons(ui, &mut t.align);
+        align_buttons(ui, &mut t.align, "Align text lines");
         let turn = ui.button(format!("↻ {}°", t.rotation.degrees()));
         if turn.on_hover_text("Rotate 90° clockwise; 90°/270° run the text across the tape").clicked() {
             t.rotation = t.rotation.next();
@@ -2696,6 +2835,7 @@ fn table_ui(
     drag: &mut Option<bool>,
     picked_fields: &[String],
     cfg: &UiConfig,
+    table_max_h: f32,
     act: &mut TableAction,
 ) {
     use egui::{Align2, Rect, Sense, pos2, vec2};
@@ -2815,7 +2955,9 @@ fn table_ui(
         })
         .collect();
     let (chk_w, num_w, row_h, hdr_h) = (30.0, 42.0, cfg.table_row_height, cfg.table_header_height);
-    let total_w = (chk_w + num_w + widths.iter().sum::<f32>()).max(ui.available_width());
+    let table_needs_vscroll = (visible.len() as f32 * row_h) > table_max_h;
+    let scroll_w = if table_needs_vscroll { ui.spacing().scroll.allocated_width() } else { 0.0 };
+    let total_w = (chk_w + num_w + widths.iter().sum::<f32>()).max((ui.available_width() - scroll_w).max(0.0));
     let (sel_bg, sel_fg, hov_bg, stripe, fg, weak, strong, grid_col) = {
         let v = ui.visuals();
         (
@@ -2937,7 +3079,7 @@ fn table_ui(
         let mut hover_tip: Option<String> = None;
         egui::ScrollArea::vertical()
             .id_salt("data_v")
-            .max_height(cfg.table_max_height)
+            .max_height(table_max_h)
             .auto_shrink([false, true])
             .show_rows(ui, row_h, visible.len(), |ui, range| {
                 let primary_down = ui.input(|i| i.pointer.primary_down());
@@ -3382,22 +3524,39 @@ impl eframe::App for App {
             egui::Panel::bottom("print_footer")
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 4 }))
                 .show_separator_line(false)
-                .show(ui, |ui| self.status_right(ui));
+                .show(ui, |ui| {
+                    ui.separator();
+                    ui.add_space(4.0);
+                    self.placeholders_ui(ui);
+                    ui.add_space(8.0);
+                    self.status_right(ui);
+                });
             egui::ScrollArea::vertical().show(ui, |ui| self.print_panel(ui));
         });
-        let status_frame = egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 4));
-        egui::Panel::bottom("status").frame(status_frame).show(ui, |ui| self.status_left(ui));
+        if let Some((msg_text, is_err, rem)) = self.active_msg().map(|(m, e, r)| (m.to_string(), e, r)) {
+            let status_frame = egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 4));
+            egui::Panel::bottom("status").frame(status_frame).show(ui, |ui| {
+                let c = if is_err { Color32::from_rgb(220, 60, 50) } else { ui.visuals().text_color() };
+                ui.colored_label(c, RichText::new(msg_text).size(12.0));
+                if !is_err {
+                    ui.ctx().request_repaint_after(rem);
+                }
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             self.preview_ui(ui);
-            ui.add_space(6.0);
             self.label_options(ui);
             ui.separator();
             self.add_block_bar(&ctx, ui);
             ui.separator();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.data_panel(&ctx, ui);
-                self.blocks_ui(&ctx, ui);
-            });
+            let editor_avail_h = ui.available_height();
+            egui::ScrollArea::vertical()
+                .id_salt("editor_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.data_panel(&ctx, ui, editor_avail_h);
+                    self.blocks_ui(&ctx, ui);
+                });
         });
         if self.dev.cfg.preview_update_modal {
             #[cfg(feature = "dev")]
@@ -3480,6 +3639,64 @@ mod tests {
         // Identical rows map to distinct targets.
         let dup = rows(&["Q", "Q"]);
         assert_eq!(remap_rows(&dup, &rows(&["Z", "Q", "Q"]), &[0, 1]), vec![1, 2]);
+    }
+
+    #[test]
+    fn align_buttons_toggle_on_click() {
+        let ctx = egui::Context::default();
+        let mut label_align = Align::Center;
+        let mut text_align = Align::Center;
+        let mut l_rects = [egui::Rect::NOTHING; 3];
+        let mut t_rects = [egui::Rect::NOTHING; 3];
+        // Frame 1: lay out BOTH align bars in the same frame and record each button's rect.
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let prev = ui.spacing().item_spacing.x;
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    l_rects[0] = icons::toggle_icon(ui, label_align == Align::Left, Icon::AlignLeft, "Align label left").rect;
+                    l_rects[1] = icons::toggle_icon(ui, label_align == Align::Center, Icon::AlignCenter, "Align label center").rect;
+                    l_rects[2] = icons::toggle_icon(ui, label_align == Align::Right, Icon::AlignRight, "Align label right").rect;
+                    ui.spacing_mut().item_spacing.x = prev;
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let prev = ui.spacing().item_spacing.x;
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    t_rects[0] = icons::toggle_icon(ui, text_align == Align::Left, Icon::AlignLeft, "Align text lines left").rect;
+                    t_rects[1] = icons::toggle_icon(ui, text_align == Align::Center, Icon::AlignCenter, "Align text lines center").rect;
+                    t_rects[2] = icons::toggle_icon(ui, text_align == Align::Right, Icon::AlignRight, "Align text lines right").rect;
+                    ui.spacing_mut().item_spacing.x = prev;
+                });
+            });
+        });
+        out.textures_delta.clear();
+        let click = |pos: egui::Pos2, label_align: &mut Align, text_align: &mut Align| {
+            for pressed in [true, false] {
+                let mut raw = egui::RawInput::default();
+                raw.events.push(egui::Event::PointerMoved(pos));
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                let mut out = ctx.run_ui(raw, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| align_buttons(ui, label_align, "Align label"));
+                        ui.horizontal_wrapped(|ui| align_buttons(ui, text_align, "Align text lines"));
+                    });
+                });
+                out.textures_delta.clear();
+            }
+        };
+        for (target, rect) in [(Align::Left, l_rects[0]), (Align::Right, l_rects[2]), (Align::Center, l_rects[1])] {
+            click(rect.center(), &mut label_align, &mut text_align);
+            assert_eq!(label_align, target);
+        }
+        for (target, rect) in [(Align::Left, t_rects[0]), (Align::Right, t_rects[2]), (Align::Center, t_rects[1])] {
+            click(rect.center(), &mut label_align, &mut text_align);
+            assert_eq!(text_align, target);
+        }
     }
 
     #[test]
