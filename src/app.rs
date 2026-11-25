@@ -2096,7 +2096,6 @@ impl App {
             ui.add(DragValue::new(&mut l.gap_mm).range(0.0..=50.0).speed(0.1).fixed_decimals(1).suffix(" mm"));
             ui.separator();
             ui.checkbox(&mut l.frame, "Frame");
-            ui.checkbox(&mut l.invert, "Invert color");
         });
         self.length_popup_was_open = popup_open;
     }
