@@ -39,6 +39,9 @@ Release builds check for updates automatically and update in place.
 | **Bluetooth** | PT-P710BT | Pair once in OS Bluetooth settings — PTLabel connects directly. *(macOS: don't click **Connect** in System Settings, or macOS grabs the printer as a braille display for ~1 min. Windows: no manual COM port setup needed.)* |
 | **USB** *(Windows)* | PT-P710BT, PT-E550W, PT-P750W, PT-P700, PT-D600, PT-P900 series, and other P-touch models | Plug-and-play over Windows' built-in `usbprint.sys` driver (no Zadig/WinUSB needed). |
 
+> [!IMPORTANT]
+> PTLabel has only been tested on the **PT-E550W** and **PT-P710BT**. Other P-touch models share the same Brother raster protocol and should work, but are untested — please open an issue if you run into any quirks.
+
 ## CLI
 
 The app binary doubles as a headless CLI for scripts and agents (`list`, `status`, `render`, `print`). See [`docs/CLI.md`](docs/CLI.md) for the full reference and `.ptlabel` schema.
