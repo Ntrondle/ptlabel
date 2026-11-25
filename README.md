@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/icon.png" width="72" height="72" alt="PTLabel icon" />
+<img src="assets/icon.png" width="100" height="100" alt="PTLabel icon" />
 
 # PTLabel
 
