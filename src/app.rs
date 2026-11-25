@@ -258,6 +258,8 @@ pub struct App {
     table_filter: String,
     /// Staged field names for multi-field insertion (`{col1} {col2}…`).
     picked_fields: Vec<String>,
+    /// True while `p.sel_rows` was auto-populated from column-header selection (cleared on manual row edits).
+    sel_rows_auto: bool,
     /// Last text block focused/edited (target for "Add to label").
     active_text_block: Option<usize>,
     /// Active drag-paint selection state in the spreadsheet table (`Some(true)` = selecting).
@@ -396,6 +398,7 @@ impl App {
             table_err: None,
             table_filter: String::new(),
             picked_fields: vec![],
+            sel_rows_auto: true,
             active_text_block: None,
             table_drag: None,
             preview_row: None,
@@ -948,6 +951,7 @@ impl App {
         self.table_drag = None;
         self.table_filter.clear();
         self.picked_fields.clear();
+        self.sel_rows_auto = true;
         self.data_collapsed = false;
         self.reload_table();
         let summary = self
@@ -1037,10 +1041,32 @@ impl App {
     }
 
     fn toggle_picked_field(&mut self, name: &str) {
-        if let Some(pos) = self.picked_fields.iter().position(|h| h == name) {
+        let added = if let Some(pos) = self.picked_fields.iter().position(|h| h == name) {
             self.picked_fields.remove(pos);
+            false
         } else {
             self.picked_fields.push(name.to_string());
+            true
+        };
+        let Some(t) = &self.table else { return };
+        if self.p.sel_rows.is_empty() {
+            self.sel_rows_auto = true;
+        }
+        if self.sel_rows_auto {
+            self.p.sel_rows = non_empty_rows_for_fields(t, &self.picked_fields, &self.table_filter);
+        } else if added {
+            let extra = non_empty_rows_for_fields(t, &[name.to_string()], &self.table_filter);
+            for r in extra {
+                if !self.p.sel_rows.contains(&r) {
+                    self.p.sel_rows.push(r);
+                }
+            }
+            self.p.sel_rows.sort_unstable();
+        }
+        if !self.p.sel_rows.is_empty()
+            && self.preview_row.is_none_or(|r| !self.p.sel_rows.contains(&r))
+        {
+            self.preview_row = self.p.sel_rows.first().copied();
         }
     }
 
@@ -1144,6 +1170,7 @@ impl App {
 
                 if let Some(t) = &self.table {
                     let mut tbl_act = TableAction::None;
+                    let sel_before = self.p.sel_rows.clone();
                     let reserve_for_blocks = if self.p.label.blocks.is_empty()
                         || self.collapsed.iter().take(self.p.label.blocks.len()).all(|&c| c)
                     {
@@ -1166,6 +1193,9 @@ impl App {
                         table_max_h,
                         &mut tbl_act,
                     );
+                    if self.p.sel_rows != sel_before {
+                        self.sel_rows_auto = self.p.sel_rows.is_empty();
+                    }
                     match tbl_act {
                         TableAction::ToggleHeader(h) => act = Some(DAct::ToggleField(h)),
                         TableAction::AddToLabel => act = Some(DAct::Insert(InsertMode::Append)),
@@ -1178,6 +1208,7 @@ impl App {
         ui.add_space(6.0);
         let reset = |app: &mut Self| {
             app.p.sel_rows.clear();
+            app.sel_rows_auto = true;
             app.preview_row = None;
             app.last_click = None;
             app.table_drag = None;
@@ -1849,11 +1880,63 @@ impl App {
         let overflow = pv.overflow;
         let warnings = pv.warnings.clone();
         ui.horizontal(|ui| {
+            let has_stepper = self.dev.cfg.show_preview_stepper
+                && self.p.label.data.is_some()
+                && self.table.is_some();
+            let avail_w = ui.available_width();
             ui.label(RichText::new(format!("{len_mm:.1} mm")).strong().size(15.0));
             ui.label(format!("on {}", tape.describe()));
-            ui.weak(format!("· print area {:.1} mm", tape.print_pins as f32 * 25.4 / 180.0));
-            if self.live_tape.is_none() {
+            if !has_stepper || avail_w > 640.0 {
+                ui.weak(format!("· print area {:.1} mm", tape.print_pins as f32 * 25.4 / 180.0));
+            }
+            if self.live_tape.is_none() && (!has_stepper || avail_w > 740.0) {
                 ui.weak("· design only");
+            }
+            if self.dev.cfg.show_preview_stepper
+                && self.p.label.data.is_some()
+                && let Some(t) = &self.table
+            {
+                let by_columns = self.p.label.data.as_ref().is_some_and(|d| d.by_columns);
+                let f = self.table_filter.to_lowercase();
+                let mut nav_rows: Vec<usize> = if self.p.sel_rows.is_empty() {
+                    (0..t.rows.len())
+                        .filter(|&i| f.is_empty() || t.rows[i].iter().any(|c| c.to_lowercase().contains(&f)))
+                        .collect()
+                } else {
+                    self.p.sel_rows.clone()
+                };
+                nav_rows.sort_unstable();
+                nav_rows.dedup();
+                if !nav_rows.is_empty() {
+                    let cur_nav_pos = self
+                        .preview_row
+                        .and_then(|r| nav_rows.iter().position(|&x| x == r))
+                        .unwrap_or(0);
+                    let active_preview_row = nav_rows[cur_nav_pos];
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_step = nav_rows.len() > 1;
+                        if ui
+                            .add_enabled(can_step, egui::Button::new("›").min_size(egui::vec2(24.0, 22.0)))
+                            .on_hover_text("Preview next label")
+                            .clicked()
+                        {
+                            let next = (cur_nav_pos + 1) % nav_rows.len();
+                            self.preview_row = Some(nav_rows[next]);
+                        }
+                        let row_lbl = t.row_labels.get(active_preview_row).map(String::as_str).unwrap_or("?");
+                        let tag = if by_columns { format!("Col {row_lbl}") } else { format!("Row {row_lbl}") };
+                        ui.weak(format!("{tag} ({}/{})", cur_nav_pos + 1, nav_rows.len()));
+                        if ui
+                            .add_enabled(can_step, egui::Button::new("‹").min_size(egui::vec2(24.0, 22.0)))
+                            .on_hover_text("Preview previous label")
+                            .clicked()
+                        {
+                            let prev = if cur_nav_pos == 0 { nav_rows.len() - 1 } else { cur_nav_pos - 1 };
+                            self.preview_row = Some(nav_rows[prev]);
+                        }
+                        ui.weak("Preview");
+                    });
+                }
             }
         });
         for warn in &warnings {
@@ -1933,21 +2016,39 @@ impl App {
     fn label_options(&mut self, ui: &mut egui::Ui) {
         let l = &mut self.p.label;
         let mut popup_open = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().interact_size.y = 32.0;
-            section_label(ui, "LENGTH", 32.0);
-            ui.separator();
+        toolbar_section(ui, "LENGTH", |ui| {
+            let outer_cr = ui.visuals().widgets.inactive.corner_radius;
+            let inner_cr = egui::CornerRadius::same(outer_cr.nw.saturating_sub(1).max(1));
             egui::Frame::new()
                 .fill(ui.visuals().faint_bg_color)
                 .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                .corner_radius(6.0)
+                .corner_radius(outer_cr)
                 .inner_margin(egui::Margin::same(2))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
                         ui.spacing_mut().interact_size.y = 26.0;
-                        ui.selectable_value(&mut l.fixed_length, false, "Auto");
-                        ui.selectable_value(&mut l.fixed_length, true, "Fixed");
+                        if ui
+                            .add(
+                                egui::Button::selectable(!l.fixed_length, "Auto")
+                                    .min_size(egui::vec2(46.0, 26.0))
+                                    .corner_radius(inner_cr),
+                            )
+                            .clicked()
+                        {
+                            l.fixed_length = false;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::selectable(l.fixed_length, "Fixed")
+                                    .min_size(egui::vec2(48.0, 26.0))
+                                    .corner_radius(inner_cr),
+                            )
+                            .clicked()
+                        {
+                            l.fixed_length = true;
+                        }
                     });
                 });
             if l.fixed_length {
@@ -2013,7 +2114,7 @@ impl App {
             ui.add(DragValue::new(&mut l.gap_mm).range(0.0..=50.0).speed(0.1).fixed_decimals(1).suffix(" mm"));
             ui.separator();
             ui.checkbox(&mut l.frame, "Frame");
-            ui.checkbox(&mut l.invert, "Invert");
+            ui.checkbox(&mut l.invert, "Invert color");
         });
         self.length_popup_was_open = popup_open;
     }
@@ -2022,11 +2123,7 @@ impl App {
         let mut add_excel = false;
         let blocks = &mut self.p.label.blocks;
         let collapsed = &mut self.collapsed;
-        ui.horizontal_wrapped(|ui| {
-            // Match the 32 px button height so the section label centres vertically with the buttons.
-            ui.spacing_mut().interact_size.y = 32.0;
-            section_label(ui, "ADD", 32.0);
-            ui.separator();
+        toolbar_section(ui, "ADD", |ui| {
             if icons::button(ui, Icon::Text, "Text").clicked() {
                 blocks.push(Block::Text(TextBlock { text: "Text".into(), ..Default::default() }));
                 collapsed.push(false);
@@ -2568,15 +2665,41 @@ const LENGTH_PRESETS: [(&str, f32); 5] = [
     ("50 ml Falcon, along the side", 60.0),
 ];
 
-/// Fixed-width muted uppercase section label centered in its slot so toolbar row titles align cleanly.
-fn section_label(ui: &mut egui::Ui, title: &str, row_h: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(58.0, row_h), egui::Sense::hover());
-    ui.painter().text(
-        egui::pos2(rect.center().x, rect.center().y + 0.5),
+/// Two-column toolbar row: fixed-width centered uppercase label + full-height vertical divider
+/// on the left, wrapping controls strictly to the right of the divider so wrapped buttons never
+/// spill under the section label.
+fn toolbar_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let label_w = 58.0;
+    let sep_gap = 12.0;
+    let resp = ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let (left_anchor, _) = ui.allocate_exact_size(egui::vec2(label_w + sep_gap, 32.0), egui::Sense::hover());
+        let right = ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().interact_size.y = 32.0;
+                add_contents(ui);
+            });
+        });
+        (left_anchor.min.x, right.response.rect)
+    });
+    let (left_x, right_rect) = resp.inner;
+    let y_min = right_rect.min.y;
+    let y_max = right_rect.max.y.max(y_min + 32.0);
+    let p = ui.painter();
+    let label_rect = egui::Rect::from_min_max(egui::pos2(left_x, y_min), egui::pos2(left_x + label_w, y_max));
+    p.text(
+        egui::pos2(label_rect.center().x, label_rect.center().y + 0.5),
         egui::Align2::CENTER_CENTER,
         title,
         FontId::new(11.5, egui::FontFamily::Name("bold".into())),
         ui.visuals().weak_text_color(),
+    );
+    let sep_x = left_x + label_w + 3.0;
+    let sep_col = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    p.line_segment(
+        [egui::pos2(sep_x, y_min + 3.0), egui::pos2(sep_x, y_max - 3.0)],
+        (1.0, sep_col),
     );
 }
 
@@ -2924,32 +3047,6 @@ fn table_ui(
         } else {
             ui.label(RichText::new(sel_label).strong());
         }
-
-        if cfg.show_preview_stepper && !nav_rows.is_empty() {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can_step = nav_rows.len() > 1;
-                if ui.add_enabled(can_step, egui::Button::new("›").min_size(vec2(24.0, 22.0)))
-                    .on_hover_text("Preview next label")
-                    .clicked()
-                {
-                    let next = (cur_nav_pos + 1) % nav_rows.len();
-                    *preview_row = Some(nav_rows[next]);
-                }
-                if let Some(ri) = active_preview_row {
-                    let row_lbl = t.row_labels.get(ri).map(String::as_str).unwrap_or("?");
-                    let tag = if by_columns { format!("Col {row_lbl}") } else { format!("Row {row_lbl}") };
-                    ui.weak(format!("{tag} ({}/{})", cur_nav_pos + 1, nav_rows.len()));
-                }
-                if ui.add_enabled(can_step, egui::Button::new("‹").min_size(vec2(24.0, 22.0)))
-                    .on_hover_text("Preview previous label")
-                    .clicked()
-                {
-                    let prev = if cur_nav_pos == 0 { nav_rows.len() - 1 } else { cur_nav_pos - 1 };
-                    *preview_row = Some(nav_rows[prev]);
-                }
-                ui.weak("Preview");
-            });
-        }
     });
 
     let font = FontId::proportional(cfg.table_font_size);
@@ -3091,7 +3188,7 @@ fn table_ui(
                 }
             }
         }
-        hresp.on_hover_text("Click checkbox to select all shown · Click any column header to add/remove it as {Column}");
+        hresp.on_hover_text("Click checkbox to select all shown · Click any column header to pick {Column} and select its non-empty rows");
 
         // Virtualised table body with drag-paint selection & right-click group selection.
         let mut hover_tip: Option<String> = None;
@@ -3323,6 +3420,24 @@ enum GroupOp {
     Add,
     Only,
     Remove,
+}
+
+/// Row indices (among rows matching `filter`) that have non-empty text in at least one of `fields`.
+fn non_empty_rows_for_fields(t: &Table, fields: &[String], filter: &str) -> Vec<usize> {
+    let cols: Vec<usize> = fields
+        .iter()
+        .filter_map(|name| t.headers.iter().position(|h| h == name))
+        .collect();
+    if cols.is_empty() {
+        return Vec::new();
+    }
+    let f = filter.to_lowercase();
+    (0..t.rows.len())
+        .filter(|&ri| {
+            (f.is_empty() || t.rows[ri].iter().any(|c| c.to_lowercase().contains(&f)))
+                && cols.iter().any(|&c| t.rows[ri].get(c).is_some_and(|v| !v.trim().is_empty()))
+        })
+        .collect()
 }
 
 /// Row click: toggle, or ⇧ adds the range from the last clicked row. `last` is a sheet row,
@@ -3746,6 +3861,31 @@ mod tests {
             click(rect.center(), &mut label_align, &mut text_align);
             assert_eq!(text_align, target);
         }
+    }
+
+    #[test]
+    fn non_empty_rows_for_fields_skips_blank_rows_and_unions_columns() {
+        let t = Table {
+            sheet: "S".into(),
+            sheets: vec!["S".into()],
+            headers: Arc::new(vec!["Sample".into(), "Note".into()]),
+            row_labels: vec!["2".into(), "3".into(), "4".into(), "5".into()],
+            rows: vec![
+                vec!["S1".into(), "".into()],
+                vec!["  ".into(), "".into()],
+                vec!["".into(), "ctrl".into()],
+                vec!["S2".into(), "ok".into()],
+            ],
+            merged: vec![],
+            merged_count: 0,
+            header_index: Some(0),
+            mtime: None,
+        };
+        assert_eq!(non_empty_rows_for_fields(&t, &["Sample".into()], ""), vec![0, 3]);
+        assert_eq!(non_empty_rows_for_fields(&t, &["Note".into()], ""), vec![2, 3]);
+        assert_eq!(non_empty_rows_for_fields(&t, &["Sample".into(), "Note".into()], ""), vec![0, 2, 3]);
+        assert_eq!(non_empty_rows_for_fields(&t, &["Sample".into(), "Note".into()], "ctrl"), vec![2]);
+        assert!(non_empty_rows_for_fields(&t, &[], "").is_empty());
     }
 
     #[test]

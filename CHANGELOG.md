@@ -2,6 +2,17 @@
 
 All notable changes to PTLabel are documented in this file.
 
+## [2.4.1] - 2026-11-25
+
+### Spreadsheet & Selection
+- **Auto-select non-empty rows on column pick:** Clicking a spreadsheet column header now selects all non-empty rows for the picked column(s) by default (skipping blank rows while respecting any active filter). Manually checking empty rows or adjusting rows afterwards is preserved on subsequent column picks.
+
+### Layout & UI Polish
+- **Preview stepper in preview header:** Moved `Preview ‹ Row N ›` to the right side of the top preview header bar (right next to the live label preview, preventing overlap on narrow windows).
+- **2-column `LENGTH` & `ADD` toolbars:** Wrapped controls now stay strictly to the right of the full-height vertical divider and never spill under the `LENGTH` or `ADD` section labels on narrow windows.
+- **Segmented `Auto | Fixed` box & naming:** Matched `Auto | Fixed` container height (`32 px`) and corner curvature to the adjacent controls, renamed **Invert** to **Invert color**, and trimmed redundant wording from the update prompt.
+- **Automated README screenshot workflow:** Added built-in framebuffer capture (`PTLABEL_SCREENSHOT` + `scripts/screenshot.py`) and a tag-triggered GitHub Action (`.github/workflows/screenshot.yml`) to keep `assets/screenshot.png` in sync automatically.
+
 ## [2.4.0] - 2026-11-25
 
 ### Chain Printing & Cutting
