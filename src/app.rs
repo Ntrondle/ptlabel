@@ -2017,40 +2017,22 @@ impl App {
         let l = &mut self.p.label;
         let mut popup_open = false;
         toolbar_section(ui, "LENGTH", |ui| {
-            let outer_cr = ui.visuals().widgets.inactive.corner_radius;
-            let inner_cr = egui::CornerRadius::same(outer_cr.nw.saturating_sub(1).max(1));
-            egui::Frame::new()
-                .fill(ui.visuals().faint_bg_color)
-                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                .corner_radius(outer_cr)
-                .inner_margin(egui::Margin::same(2))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
-                        ui.spacing_mut().interact_size.y = 26.0;
-                        if ui
-                            .add(
-                                egui::Button::selectable(!l.fixed_length, "Auto")
-                                    .min_size(egui::vec2(46.0, 26.0))
-                                    .corner_radius(inner_cr),
-                            )
-                            .clicked()
-                        {
-                            l.fixed_length = false;
-                        }
-                        if ui
-                            .add(
-                                egui::Button::selectable(l.fixed_length, "Fixed")
-                                    .min_size(egui::vec2(48.0, 26.0))
-                                    .corner_radius(inner_cr),
-                            )
-                            .clicked()
-                        {
-                            l.fixed_length = true;
-                        }
-                    });
-                });
+            let h = ui.spacing().interact_size.y;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                if ui
+                    .add(egui::Button::new("Auto").selected(!l.fixed_length).min_size(egui::vec2(52.0, h)))
+                    .clicked()
+                {
+                    l.fixed_length = false;
+                }
+                if ui
+                    .add(egui::Button::new("Fixed").selected(l.fixed_length).min_size(egui::vec2(54.0, h)))
+                    .clicked()
+                {
+                    l.fixed_length = true;
+                }
+            });
             if l.fixed_length {
                 let was_open = self.length_popup_was_open;
                 let input = &mut self.length_input;
