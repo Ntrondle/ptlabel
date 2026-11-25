@@ -29,7 +29,7 @@ Once installed, the application will check for updates and prompt when a new ver
 - **Composable blocks** — multi-line text (any system font, auto-fit or pt size, `0/90/180/270°` rotation), QR, Data Matrix (square or rectangular for narrow tape), Code 128/39, EAN-13/8, UPC-A, images (threshold or dither), number sequences, and spacers.
 - **Spreadsheet support** — open `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.ods`, or `.csv` files, you can then insert a `{Column}` field.
 - **Templates & sequences** — dynamic `{n}`, `{n:03}`, `{seq}` / `{seq2}`, `{date}`, and `{time}` placeholders across text, QR, and barcodes.
-- **Layout & output** — auto or fixed length, frame, high-res `180×360` dpi, mirror, chain printing, half-cut & cut-every-N (PT-E550W), PNG export, and `.ptlabel` JSON files.
+- **Layout & output** — auto or fixed length, frame, invert, high-res `180×360` dpi, mirror, chain printing, half-cut & cut-every-N (PT-E550W), PNG export, and `.ptlabel` JSON files.
 
 ## Printers
 
