@@ -6,7 +6,7 @@
 
 **Fast native label app & CLI for Brother P-touch printers on macOS and Windows.**
 
-[Download](https://github.com/Ntrondle/ptlabel/releases/latest) · [CLI Reference](docs/CLI.md) · [Protocol Notes](docs/PLAN.md)
+[Download](https://github.com/Ntrondle/ptlabel/releases/latest) · [CLI Reference](docs/CLI.md)
 
 <br />
 
