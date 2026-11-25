@@ -78,4 +78,8 @@ PTLabel is built with many open-source Rust crates, including:
 
 See [`THIRD_PARTY_LICENSES.txt`](THIRD_PARTY_LICENSES.txt) for the full list of dependencies, copyright notices, and license texts.
 
+## License
+
+PTLabel is licensed under the [MIT License](LICENSE).
+
 > Brother and P-touch are registered trademarks of Brother Industries, Ltd. PTLabel is an independent project and is not affiliated with or endorsed by Brother.
