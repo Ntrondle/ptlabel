@@ -3662,7 +3662,9 @@ impl eframe::App for App {
                     ui.separator();
                     ui.add_space(4.0);
                     self.placeholders_ui(ui);
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
                     self.status_right(ui);
                 });
             egui::ScrollArea::vertical().show(ui, |ui| self.print_panel(ui));

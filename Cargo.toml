@@ -1,6 +1,6 @@
 [package]
 name = "ptlabel"
-version = "2.4.1"
+version = "2.4.2"
 edition = "2024"
 description = "Fast label app for Brother P-touch printers (USB, Bluetooth, Wi-Fi)"
 license = "MIT"

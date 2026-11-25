@@ -2,6 +2,17 @@
 
 All notable changes to PTLabel are documented in this file.
 
+## [2.4.2] - 2026-11-25
+
+### Layout & UI Polish
+- **Unified `Auto` / `Fixed` length toggles:** Replaced the outlined frame box with standard `32 px` borderless toggle pills matching the adjacent length dropdown, alignment buttons, and `ADD` toolbar.
+- **Smooth trackpad scroll past Excel table:** Disabled rubber-band overscroll trap on the nested spreadsheet table and added a small (`24 px`) edge threshold so continuous trackpad swipes and momentum flow smoothly into the label blocks below without getting stuck.
+- **Cleaner Excel toolbar & Print panel footer:** Removed the unused **Invert** selection button from the Excel row bar (`All` / `None`), and added a matching horizontal divider between the placeholder reminder and keyboard shortcuts in the Print panel footer.
+
+### Docs, Licensing & CI
+- **MIT License & credits:** Added `LICENSE` (MIT), `THIRD_PARTY_LICENSES.txt` for all dependencies, README credits & tested-printer notice, and removed the redistributed Brother PDF.
+- **README screenshot workflow fix:** Fixed PEP 668 `pip install` in `.github/workflows/screenshot.yml` using an isolated virtualenv.
+
 ## [2.4.1] - 2026-11-25
 
 ### Spreadsheet & Selection
