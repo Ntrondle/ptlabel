@@ -4,7 +4,7 @@ Native macOS (Rust) label app for **Brother PT-P710BT** (P-touch CUBE Plus, Blue
 
 ## Research findings
 
-Source: Brother *Raster Command Reference PT-E550W/P750W/P710BT v1.02* (`docs/cv_pte550wp750wp710bt_eng_raster_102.pdf`) plus probing the real E550W at 192.168.1.160.
+Source: Brother *Raster Command Reference PT-E550W/P750W/P710BT v1.02* (Brother Developer Center) plus probing the real E550W at 192.168.1.160.
 
 | | PT-P710BT | PT-E550W |
 |---|---|---|

@@ -1,5 +1,5 @@
 //! Brother P-touch raster protocol (PT-E550W / PT-P750W / PT-P710BT).
-//! Reference: docs/cv_pte550wp750wp710bt_eng_raster_102.pdf
+//! Reference: Brother Raster Command Reference PT-E550W/P750W/P710BT v1.02.
 
 pub mod media;
 pub mod packbits;

@@ -65,3 +65,17 @@ scripts/bundle.sh --dmg       # macOS: build target/PTLabel.dmg
 cargo build --release         # Windows: target/release/ptlabel.exe
 cargo test
 ```
+
+## Credits
+
+PTLabel is built with many open-source Rust crates, including:
+
+- **[egui / eframe](https://github.com/emilk/egui)** (Emil Ernerfeldt & contributors) & **[wgpu](https://github.com/gfx-rs/wgpu)** — native GUI and Metal/DX12 rendering
+- **[cosmic-text](https://github.com/pop-os/cosmic-text)** (System76 / Jeremy Soller) — system font discovery and text shaping
+- **[calamine](https://github.com/tafia/calamine)** (Johann Tuffe) — Excel and OpenDocument spreadsheet parsing
+- **[qrcode](https://github.com/kennytm/qrcode-rust)**, **[datamatrix](https://github.com/jannschu/datamatrix-rs)**, **[barcoders](https://github.com/buntine/barcoders)**, and **[image](https://github.com/image-rs/image)** — 1D/2D barcode generation and image processing
+- **[mdns-sd](https://github.com/keepsimple1/mdns-sd)**, **[objc2](https://github.com/madsmtm/objc2)**, **[windows-sys](https://github.com/microsoft/windows-rs)**, **[serialport](https://github.com/serialport/serialport-rs)** (MPL-2.0), **[rfd](https://github.com/PolyMeilex/rfd)**, and **[ureq](https://github.com/algesten/ureq)** — networking, Bluetooth/USB transports, native dialogs, and self-updates
+
+See [`THIRD_PARTY_LICENSES.txt`](THIRD_PARTY_LICENSES.txt) for the full list of dependencies, copyright notices, and license texts.
+
+> Brother and P-touch are registered trademarks of Brother Industries, Ltd. PTLabel is an independent project and is not affiliated with or endorsed by Brother.
