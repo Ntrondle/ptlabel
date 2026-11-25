@@ -48,12 +48,24 @@ fn app_name() -> String {
 
 pub fn run() -> anyhow::Result<()> {
     let name = app_name();
+    let shot_mode = std::env::var_os("PTLABEL_SCREENSHOT").is_some();
+    let inner_size = std::env::var("PTLABEL_WINDOW_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?])
+        })
+        .unwrap_or([1240.0, 800.0]);
+    let mut vb = egui::ViewportBuilder::default()
+        .with_title(&name)
+        .with_inner_size(inner_size)
+        .with_min_inner_size([960.0, 600.0])
+        .with_icon(window_icon());
+    if shot_mode {
+        vb = vb.with_decorations(false);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(&name)
-            .with_inner_size([1240.0, 800.0])
-            .with_min_inner_size([960.0, 600.0])
-            .with_icon(window_icon()),
+        viewport: vb,
         // Metal (wgpu) instead of OpenGL: no extra AppKit backing surfaces. Frame latency 1 =
         // two drawables instead of three, ~15 MB less at Retina size (egui still uses 2 while resizing).
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
@@ -274,6 +286,10 @@ pub struct App {
     upd: (crossbeam_channel::Sender<Upd>, crossbeam_channel::Receiver<Upd>),
     /// Live UI config (`dev-ui.json` watcher + Dev Inspector in `--features dev` builds).
     dev: DevUi,
+    /// Optional automated screenshot capture path (`PTLABEL_SCREENSHOT` env var, used by CI/scripts).
+    screenshot_path: Option<String>,
+    screenshot_frames: u8,
+    screenshot_taken: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,6 +421,9 @@ impl App {
             checked: None,
             upd: crossbeam_channel::unbounded(),
             dev: DevUi::new(),
+            screenshot_path: std::env::var("PTLABEL_SCREENSHOT").ok().filter(|s| !s.is_empty()),
+            screenshot_frames: 0,
+            screenshot_taken: false,
         };
         let (dialog_tx, dialog_rx) = crossbeam_channel::unbounded();
         app.dialog_tx = dialog_tx;
@@ -707,16 +726,15 @@ impl App {
                     });
             }
 
-            ui.add_space(14.0);
             if self.updating {
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(RichText::new("Downloading and installing…").size(14.0).weak());
                 });
             } else if printing {
+                ui.add_space(14.0);
                 ui.label(RichText::new("Printing: update once the queue is done.").size(13.5).color(Color32::from_rgb(230, 150, 20)));
-            } else {
-                ui.label(RichText::new("PTLabel will download the update, replace the app, and reopen automatically.").size(13.5).weak());
             }
             if let Some(e) = &self.update_error {
                 ui.add_space(8.0);
@@ -3572,6 +3590,37 @@ impl eframe::App for App {
         }
         self.dev.window(&ctx);
         self.update_title(&ctx);
+
+        if self.screenshot_path.is_some() {
+            ctx.set_theme(egui::Theme::Light);
+            if let Ok(z) = std::env::var("PTLABEL_ZOOM").and_then(|s| s.parse::<f32>().map_err(|_| std::env::VarError::NotPresent)) {
+                ctx.set_zoom_factor(z.clamp(0.5, 2.0));
+            }
+            if !self.screenshot_taken {
+                ctx.request_repaint();
+                if self.preview.is_some() && self.preview_job.is_none() {
+                    self.screenshot_frames = self.screenshot_frames.saturating_add(1);
+                    if self.screenshot_frames >= 6 {
+                        self.screenshot_taken = true;
+                        let path = self.screenshot_path.clone().unwrap();
+                        let c = ctx.clone();
+                        ctx.request_screenshot(move |img| {
+                            let [w, h] = img.size;
+                            if let Err(e) = image::save_buffer(
+                                &path,
+                                img.as_raw(),
+                                w as u32,
+                                h as u32,
+                                image::ColorType::Rgba8,
+                            ) {
+                                eprintln!("ptlabel: screenshot save failed: {e}");
+                            }
+                            c.send_viewport_cmd(egui::ViewportCommand::Close);
+                        });
+                    }
+                }
+            }
+        }
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {

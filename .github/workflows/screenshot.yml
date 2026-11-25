@@ -1,0 +1,57 @@
+name: Update README screenshot
+
+# Runs automatically when a version tag (v*) or screenshot tag (screenshot*) is pushed,
+# or manually from Actions → Update README screenshot → Run workflow.
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'screenshot*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  screenshot:
+    runs-on: macos-latest # Apple Silicon (Metal GPU + WindowServer)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build PTLabel
+        run: cargo build --release
+
+      - name: Install Pillow & pngquant
+        run: |
+          python3 -m pip install --quiet pillow
+          brew install pngquant || true
+
+      - name: Capture README screenshot
+        run: python3 scripts/screenshot.py
+
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptlabel-readme-screenshot
+          path: assets/screenshot.png
+
+      - name: Commit updated screenshot to main
+        run: |
+          cp assets/screenshot.png /tmp/ptlabel_new_screenshot.png
+          git fetch origin main
+          git checkout -B main origin/main
+          cp /tmp/ptlabel_new_screenshot.png assets/screenshot.png
+          if git diff --quiet assets/screenshot.png; then
+            echo "Screenshot unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add assets/screenshot.png
+          git commit -m "Update README screenshot (${GITHUB_REF_NAME}) [skip ci]"
+          git push origin main
