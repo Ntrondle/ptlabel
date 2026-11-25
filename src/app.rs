@@ -3172,8 +3172,16 @@ fn table_ui(
         hresp.on_hover_text("Click checkbox to select all shown · Click any column header to pick {Column} and select its non-empty rows");
 
         // Virtualised table body with drag-paint selection & right-click group selection.
+        // Disable rubber-banding on the nested vertical table so trackpad scrolling isn't
+        // trapped in overscroll at the bottom/top edge; NestedScrollGate adds a small detent
+        // before continuing smoothly into the outer editor ScrollArea.
         let mut hover_tip: Option<String> = None;
-        egui::ScrollArea::vertical()
+        let prev_scroll_y = ui.input(|i| i.smooth_scroll_delta().y);
+        let scroll_src = ui.input(|i| i.scroll_source());
+        let now = ui.input(|i| i.time);
+        let prev_rubber = ui.spacing().scroll.kinetic.rubber_band;
+        ui.spacing_mut().scroll.kinetic.rubber_band = false;
+        let table_scroll = egui::ScrollArea::vertical()
             .id_salt("data_v")
             .max_height(table_max_h)
             .auto_shrink([false, true])
@@ -3341,6 +3349,26 @@ fn table_ui(
                     });
                 }
             });
+        ui.spacing_mut().scroll.kinetic.rubber_band = prev_rubber;
+        let mut table_rect = table_scroll.inner_rect;
+        table_rect.max.x += 20.0;
+        let pointer_over_table = ui.rect_contains_pointer(table_rect);
+        let inner_scrollable = table_scroll.content_size.y > table_scroll.inner_rect.height() + 0.5;
+        let rem_scroll_y = ui.input(|i| i.smooth_scroll_delta().y);
+        let gate_id = table_scroll.id.with("edge_gate");
+        let mut gate: NestedScrollGate = ui.data(|d| d.get_temp(gate_id)).unwrap_or_default();
+        let filtered_y = gate.filter(
+            prev_scroll_y,
+            rem_scroll_y,
+            scroll_src,
+            now,
+            pointer_over_table,
+            inner_scrollable,
+        );
+        ui.data_mut(|d| d.insert_temp(gate_id, gate));
+        if filtered_y != rem_scroll_y {
+            ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = filtered_y);
+        }
         if let Some(tip) = hover_tip {
             egui::Tooltip::always_open(
                 ui.ctx().clone(),
@@ -3876,5 +3904,132 @@ mod tests {
         assert_eq!(w, 2);
         assert_eq!(out, [&px[0..8], &px[12..20]].concat());
         assert_eq!(crop_width(px.clone(), 3, 2, 8), (3, px));
+    }
+
+    #[test]
+    fn nested_scroll_gate_breaks_through_on_trackpad_threshold() {
+        use egui::MouseWheelSource;
+        let mut g = NestedScrollGate::default();
+        // Scroll inside table (consumed by inner ScrollArea).
+        assert_eq!(g.filter(-20.0, 0.0, Some(MouseWheelSource::Trackpad), 1.00, true, true), 0.0);
+        // Hit bottom edge: push below threshold is absorbed, pushing past unlocks and passes excess.
+        assert_eq!(g.filter(-20.0, -20.0, Some(MouseWheelSource::Trackpad), 1.02, true, true), 0.0);
+        assert_eq!(g.filter(-20.0, -20.0, Some(MouseWheelSource::Trackpad), 1.04, true, true), -8.0);
+        // Once unlocked, both Trackpad and Momentum pass straight through to the outer ScrollArea.
+        assert_eq!(g.filter(-15.0, -15.0, Some(MouseWheelSource::Trackpad), 1.06, true, true), -15.0);
+        assert_eq!(g.filter(-10.0, -10.0, Some(MouseWheelSource::Momentum), 1.08, true, true), -10.0);
+
+        // Scrolling back inside resets the gate; flick momentum alone stops cleanly at the edge.
+        assert_eq!(g.filter(12.0, 0.0, Some(MouseWheelSource::Trackpad), 2.00, true, true), 0.0);
+        assert_eq!(g.filter(-15.0, -15.0, Some(MouseWheelSource::Momentum), 2.02, true, true), 0.0);
+        // A fresh trackpad touch right after momentum unlocks immediately.
+        assert_eq!(g.filter(-10.0, -10.0, Some(MouseWheelSource::Trackpad), 2.05, true, true), -10.0);
+
+        // Mouse wheel always passes straight through at the edge.
+        assert_eq!(g.filter(-20.0, 0.0, Some(MouseWheelSource::Wheel), 3.00, true, true), 0.0);
+        assert_eq!(g.filter(-20.0, -20.0, Some(MouseWheelSource::Wheel), 3.02, true, true), -20.0);
+    }
+}
+
+/// Trackpad scroll-chaining gate for a nested vertical `ScrollArea` (the Excel table):
+/// prevents accidental overshoot on a quick flick while letting a continued trackpad swipe
+/// past a small detent (`TABLE_EDGE_SCROLL_THRESHOLD`) smoothly scroll the outer editor.
+const TABLE_EDGE_SCROLL_THRESHOLD: f32 = 32.0;
+const TABLE_EDGE_PAUSE_SECS: f64 = 0.15;
+
+#[derive(Clone, Copy, Debug)]
+struct NestedScrollGate {
+    last_event_time: f64,
+    last_was_momentum: bool,
+    /// +1 = pushing bottom (scrolling down), -1 = pushing top (scrolling up), 0 = none.
+    edge: i8,
+    pushed: f32,
+    unlocked: bool,
+}
+
+impl Default for NestedScrollGate {
+    fn default() -> Self {
+        Self {
+            last_event_time: f64::NEG_INFINITY,
+            last_was_momentum: false,
+            edge: 0,
+            pushed: 0.0,
+            unlocked: false,
+        }
+    }
+}
+
+impl NestedScrollGate {
+    fn filter(
+        &mut self,
+        prev_delta_y: f32,
+        rem_delta_y: f32,
+        source: Option<egui::MouseWheelSource>,
+        now: f64,
+        pointer_over_inner: bool,
+        inner_scrollable: bool,
+    ) -> f32 {
+        // Inner scroll area consumed vertical scroll -> actively scrolling inside the table.
+        if prev_delta_y != 0.0 && rem_delta_y == 0.0 {
+            self.last_event_time = now;
+            self.last_was_momentum = source == Some(egui::MouseWheelSource::Momentum);
+            self.edge = 0;
+            self.pushed = 0.0;
+            self.unlocked = false;
+            return 0.0;
+        }
+        if rem_delta_y == 0.0 || !pointer_over_inner || !inner_scrollable {
+            return rem_delta_y;
+        }
+
+        let is_trackpad = matches!(
+            source,
+            Some(egui::MouseWheelSource::Trackpad | egui::MouseWheelSource::Momentum)
+        );
+        if !is_trackpad {
+            self.edge = 0;
+            self.pushed = 0.0;
+            self.unlocked = false;
+            self.last_was_momentum = false;
+            return rem_delta_y;
+        }
+
+        let fresh_gesture = (now - self.last_event_time > TABLE_EDGE_PAUSE_SECS)
+            || (self.last_was_momentum && source == Some(egui::MouseWheelSource::Trackpad));
+        self.last_event_time = now;
+        self.last_was_momentum = source == Some(egui::MouseWheelSource::Momentum);
+
+        let dir: i8 = if rem_delta_y < 0.0 { 1 } else { -1 };
+
+        // Starting a new trackpad swipe while already resting at the table edge passes straight through.
+        if fresh_gesture && source == Some(egui::MouseWheelSource::Trackpad) {
+            self.edge = dir;
+            self.pushed = TABLE_EDGE_SCROLL_THRESHOLD;
+            self.unlocked = true;
+            return rem_delta_y;
+        }
+
+        if self.edge != dir {
+            self.edge = dir;
+            self.pushed = 0.0;
+            self.unlocked = false;
+        }
+
+        if self.unlocked {
+            return rem_delta_y;
+        }
+
+        // Residual flick inertia stops cleanly at the edge; active finger movement pushes past the detent.
+        if source == Some(egui::MouseWheelSource::Momentum) {
+            return 0.0;
+        }
+
+        self.pushed += rem_delta_y.abs();
+        if self.pushed >= TABLE_EDGE_SCROLL_THRESHOLD {
+            self.unlocked = true;
+            let excess = self.pushed - TABLE_EDGE_SCROLL_THRESHOLD;
+            return if rem_delta_y < 0.0 { -excess } else { excess };
+        }
+        0.0
     }
 }
