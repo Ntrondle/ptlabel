@@ -2,6 +2,11 @@
 
 All notable changes to PTLabel are documented in this file.
 
+## [2.4.3] - 2026-11-25
+
+### Layout & UI Polish
+- **Left-aligned Print panel shortcuts:** Aligned the `⌘P print  ⌘S save  ⌘O open  ⌘N new` shortcut hints (and update indicator) to the left under the footer divider to match the placeholder reminder above it.
+
 ## [2.4.2] - 2026-11-25
 
 ### Layout & UI Polish
