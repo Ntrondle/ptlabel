@@ -16,6 +16,9 @@ pub enum Icon {
     Sheet,
     ChevronDown,
     ChevronRight,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
 }
 
 impl Icon {
@@ -92,22 +95,13 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, col: Color32) {
             p.circle_filled(at(0.81, 0.44), side * 0.05, col);
         }
         Icon::Sequence => {
-            // "123" drawn as strokes; each digit sits in a 0.5-wide cell.
-            let digit = |ox: f32, pts: Vec<(f32, f32)>| {
-                let pts = pts.into_iter().map(|(u, v)| at(ox + 0.07 + u * 0.36, 0.12 + v * 0.76)).collect();
-                p.add(Shape::line(pts, stroke));
-            };
-            let arc = |cu: f32, cv: f32, ru: f32, rv: f32, a0: f32, a1: f32| -> Vec<(f32, f32)> {
-                (0..=12).map(|k| a0 + (a1 - a0) * k as f32 / 12.0).map(|a| (cu + ru * a.cos(), cv + rv * a.sin())).collect()
-            };
-            use std::f32::consts::PI;
-            digit(0.0, vec![(0.2, 0.22), (0.62, 0.0), (0.62, 1.0)]);
-            let mut two = arc(0.5, 0.27, 0.5, 0.27, PI, 2.0 * PI + 0.5);
-            two.extend([(0.0, 1.0), (1.0, 1.0)]);
-            digit(0.5, two);
-            let mut three = arc(0.45, 0.26, 0.45, 0.24, PI + 0.6, 2.5 * PI);
-            three.extend(arc(0.45, 0.74, 0.5, 0.26, -0.5 * PI, PI - 0.6));
-            digit(1.0, three);
+            p.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                "123",
+                egui::FontId::new(side * 0.85, egui::FontFamily::Name("bold".into())),
+                col,
+            );
         }
         Icon::Sheet => {
             p.rect_stroke(rect(0.04, 0.10, 0.96, 0.90), side * 0.08, stroke, egui::StrokeKind::Middle);
@@ -130,15 +124,32 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, col: Color32) {
             let bold = Stroke::new((side / 7.0).max(1.8), col);
             p.add(Shape::line(vec![at(0.32, 0.18), at(0.68, 0.50), at(0.32, 0.82)], bold));
         }
+        Icon::AlignLeft | Icon::AlignCenter | Icon::AlignRight => {
+            let h = 0.115;
+            let rad = side * 0.04;
+            let bars: [(f32, f32); 4] = [(0.14, 0.86), (0.37, 0.56), (0.60, 0.76), (0.83, 0.44)];
+            for (cy, w) in bars {
+                let x0 = match icon {
+                    Icon::AlignLeft => 0.07,
+                    Icon::AlignCenter => 0.5 - w * 0.5,
+                    Icon::AlignRight => 0.93 - w,
+                    _ => unreachable!(),
+                };
+                p.rect_filled(rect(x0, cy - h * 0.5, x0 + w, cy + h * 0.5), rad, col);
+            }
+        }
     }
 }
 
-/// The PTLabel mark: tape running across a blue tile with a cut on each side
+/// The PTLabel mark: tape running across a blue tile (yellow in dev builds) with a cut on each side
 /// (same geometry as assets/icon.png, see scripts/make_icon.py).
 pub fn paint_logo(p: &Painter, r: Rect) {
     let side = r.width().min(r.height());
     let r = Rect::from_center_size(r.center(), Vec2::splat(side));
     let at = |x: f32, y: f32| -> Pos2 { pos2(r.min.x + x * side, r.min.y + y * side) };
+    #[cfg(feature = "dev")]
+    let tile = Color32::from_rgb(238, 178, 24);
+    #[cfg(not(feature = "dev"))]
     let tile = Color32::from_rgb(58, 123, 234);
     p.rect_filled(r, side * 0.225, tile);
     p.rect_filled(Rect::from_min_max(at(0.0, 0.35), at(1.0, 0.65)), 0.0, Color32::WHITE);
@@ -194,4 +205,18 @@ pub fn button(ui: &mut Ui, icon: Icon, text: &str) -> Response {
         paint(ui.painter(), r, icon, col);
     }
     out.response
+}
+
+/// Compact square toggle button with a centred vector icon (used for text alignment bars).
+pub fn toggle_icon(ui: &mut Ui, selected: bool, icon: Icon, tooltip: &str) -> Response {
+    let id = egui::IdSalt::new(icon);
+    let out = egui::Button::new(egui::Atom::custom(id, vec2(15.0 * icon.aspect(), 15.0)))
+        .selected(selected)
+        .min_size(vec2(30.0, 28.0))
+        .atom_ui(ui);
+    if let Some(r) = out.rect(id) {
+        let col = ui.style().interact_selectable(&out.response, selected).text_color();
+        paint(ui.painter(), r, icon, col);
+    }
+    out.response.on_hover_text(tooltip)
 }

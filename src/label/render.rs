@@ -153,6 +153,24 @@ impl Renderer {
         v
     }
 
+    /// Raw font bytes + collection index for a clean system bold sans-serif face (used by egui UI).
+    pub fn bold_ui_font(&self) -> Option<(Vec<u8>, u32)> {
+        use cosmic_text::fontdb::{Family as DbFamily, Query, Stretch, Style as DbStyle, Weight as DbWeight};
+        let db = self.fs.db();
+        let id = db.query(&Query {
+            families: &[
+                DbFamily::Name("Helvetica Neue"),
+                DbFamily::Name("Segoe UI"),
+                DbFamily::Name("Arial"),
+                DbFamily::SansSerif,
+            ],
+            weight: DbWeight::BOLD,
+            stretch: Stretch::Normal,
+            style: DbStyle::Normal,
+        })?;
+        db.with_face_data(id, |data, index| (data.to_vec(), index))
+    }
+
     /// Bytes held by rasterised glyphs in the swash cache.
     fn glyph_cache_bytes(&self) -> usize {
         self.cache.image_cache.values().flatten().map(|i| i.data.len()).sum()
@@ -179,13 +197,24 @@ impl Renderer {
         let pad_h = if label.frame { frame_t + mm_px(1.2, s) } else { 0 };
         let gap = mm_px(label.gap_mm, s);
 
-        let mut parts: Vec<Canvas> = Vec::new();
+        struct Part {
+            canvas: Canvas,
+            /// Set for auto-sized Text/Sequence blocks that can shrink to fit a fixed label length.
+            auto_text: Option<(TextBlock, String)>,
+        }
+
+        let mut parts: Vec<Part> = Vec::new();
         let mut seq_idx = 0usize;
         for b in &label.blocks {
-            let r = match b {
-                Block::Text(t) => Ok(self.text_block(t, &expand(&t.text, vars), inner_h, s)),
-                Block::Qr(q) => self.qr_block(q, &expand(&q.data, vars), inner_h, s),
-                Block::DataMatrix(d) => self.dm_block(d, &expand(&d.data, vars), inner_h, s),
+            let (r, auto_text) = match b {
+                Block::Text(t) => {
+                    let text = expand(&t.text, vars);
+                    let c = self.text_block(t, &text, inner_h, s, 1.0);
+                    let auto = t.size_pt.is_none().then(|| (t.clone(), text));
+                    (Ok(c), auto)
+                }
+                Block::Qr(q) => (self.qr_block(q, &expand(&q.data, vars), inner_h, s), None),
+                Block::DataMatrix(d) => (self.dm_block(d, &expand(&d.data, vars), inner_h, s), None),
                 Block::Sequence(q) => {
                     let idx = seq_idx;
                     seq_idx += 1;
@@ -193,22 +222,26 @@ impl Renderer {
                         continue;
                     }
                     let text = vars.seqs.get(idx).cloned().unwrap_or_else(|| q.format(vars.index, vars));
-                    Ok(self.text_block(&q.style, &text, inner_h, s))
+                    let c = self.text_block(&q.style, &text, inner_h, s, 1.0);
+                    let auto = q.style.size_pt.is_none().then(|| (q.style.clone(), text));
+                    (Ok(c), auto)
                 }
-                Block::Barcode(bc) => self.barcode_block(bc, &expand(&bc.data, vars), inner_h, s),
-                Block::Image(i) => self.image_block(i, inner_h, s),
-                Block::Spacer { mm } => Ok(Canvas::new(mm_px(*mm, s), inner_h)),
+                Block::Barcode(bc) => (self.barcode_block(bc, &expand(&bc.data, vars), inner_h, s), None),
+                Block::Image(i) => (self.image_block(i, inner_h, s), None),
+                Block::Spacer { mm } => (Ok(Canvas::new(mm_px(*mm, s), inner_h)), None),
             };
             match r {
-                Ok(c) if c.w > 0 => parts.push(c),
+                Ok(c) if c.w > 0 => parts.push(Part { canvas: c, auto_text }),
                 Ok(_) => {}
                 Err(e) => warnings.push(format!("{}: {e}", b.kind_name())),
             }
         }
 
-        let content_w: usize =
-            parts.iter().map(|c| c.w).sum::<usize>() + gap * parts.len().saturating_sub(1);
-        let natural = content_w + 2 * pad_h;
+        let measure = |parts: &[Part]| -> usize {
+            let cw: usize = parts.iter().map(|p| p.canvas.w).sum::<usize>() + gap * parts.len().saturating_sub(1);
+            cw + 2 * pad_h
+        };
+        let mut natural = measure(&parts);
 
         // Minimum raster length (spec 2.3.4) in canvas pixels.
         let min_px = if opts.high_res { min_lines(true) * s / 2 } else { min_lines(false) * s };
@@ -218,7 +251,39 @@ impl Renderer {
         if label.fixed_length {
             let target = snap((label.length_mm - 2.0 * margin_mm_eff).max(0.0) * dpmm(s), s);
             if natural > target {
+                // Shrink auto-sized text blocks proportionally so the content fits the fixed length.
+                let fixed_w: usize = parts
+                    .iter()
+                    .filter(|p| p.auto_text.is_none())
+                    .map(|p| p.canvas.w)
+                    .sum::<usize>()
+                    + gap * parts.len().saturating_sub(1)
+                    + 2 * pad_h;
+                let avail_text = target.saturating_sub(fixed_w);
+                let mut auto_w: usize = parts.iter().filter(|p| p.auto_text.is_some()).map(|p| p.canvas.w).sum();
+                if auto_w > 0 && avail_text > 0 {
+                    let mut scale = (avail_text as f32 / auto_w as f32).clamp(0.05, 1.0);
+                    for pass in 0..4 {
+                        for p in &mut parts {
+                            if let Some((tb, txt)) = &p.auto_text {
+                                p.canvas = self.text_block(tb, txt, inner_h, s, scale);
+                            }
+                        }
+                        natural = measure(&parts);
+                        if natural <= target || scale <= 0.05 || pass == 3 {
+                            break;
+                        }
+                        auto_w = parts.iter().filter(|p| p.auto_text.is_some()).map(|p| p.canvas.w).sum();
+                        if auto_w == 0 {
+                            break;
+                        }
+                        scale = (scale * (avail_text as f32 / auto_w as f32) * 0.98).clamp(0.05, scale * 0.95);
+                    }
+                }
+            }
+            if natural > target {
                 overflow = true;
+                total_w = natural.max(min_px);
             } else {
                 total_w = target.max(min_px);
             }
@@ -234,9 +299,9 @@ impl Renderer {
                 Align::Right => slack,
             };
         let mut x = x0;
-        for c in &parts {
-            canvas.blit(c, x, frame_t + pad_v);
-            x += c.w + gap;
+        for p in &parts {
+            canvas.blit(&p.canvas, x, frame_t + pad_v);
+            x += p.canvas.w + gap;
         }
         if label.frame {
             let (w, t) = (total_w as i64, frame_t as i64);
@@ -278,8 +343,9 @@ impl Renderer {
         m
     }
 
-    /// Multi-line text, auto-fit to `h` unless a size is set.
-    fn text_block(&mut self, t: &TextBlock, text: &str, h: usize, s: usize) -> Canvas {
+    /// Multi-line text, auto-fit to `h` unless a size is set. `scale` (< 1.0) shrinks auto-sized
+    /// text to fit a fixed label length while keeping aspect ratio and vertical centering.
+    fn text_block(&mut self, t: &TextBlock, text: &str, h: usize, s: usize, scale: f32) -> Canvas {
         let (asc, desc) = self.font_metrics(&t.font, t.bold, t.italic);
         let em_box = asc + desc;
         // Ignore stray blank lines at the ends and trailing spaces (they shrink/offset auto-fit).
@@ -294,11 +360,11 @@ impl Renderer {
         let spacing = t.line_spacing.clamp(0.5, 3.0);
         let size = match t.size_pt {
             Some(pt) => pt.max(1.0) * 180.0 * s as f32 / 72.0,
-            None => h as f32 / (em_box * (1.0 + (n - 1.0) * spacing)),
+            None => (h as f32 / (em_box * (1.0 + (n - 1.0) * spacing)) * scale).max(1.0),
         };
         let style = LineStyle { underline: t.underline, align: t.align, spacing, italic: t.italic };
         if t.rotation != super::Rotation::R0 {
-            return self.turned_lines(t, &lines, style, size, (asc, desc), h, s);
+            return self.turned_lines(t, &lines, style, size, (asc, desc), h, s, scale);
         }
         self.draw_lines(&lines, &attrs(&t.font, t.bold, t.italic), style, size, (asc, desc), h, s)
     }
@@ -316,6 +382,7 @@ impl Renderer {
         (asc, desc): (f32, f32),
         h: usize,
         s: usize,
+        scale: f32,
     ) -> Canvas {
         let a = attrs(&t.font, t.bold, t.italic);
         let q = t.rotation.quarters();
@@ -329,7 +396,7 @@ impl Renderer {
             if unit_w <= 0.0 {
                 return Canvas::new(0, h);
             }
-            size = h.saturating_sub(2 * s) as f32 / unit_w;
+            size = (h.saturating_sub(2 * s) as f32 / unit_w * scale).max(1.0);
         }
         let n = lines.len() as f32;
         loop {
@@ -865,6 +932,55 @@ mod tests {
         let hi = PageOpts { high_res: true, ..opts };
         let out2 = r.render(&label, &tape, &Vars::default(), &hi);
         assert!((out2.bitmap.w as i64 - 2 * out.bitmap.w as i64).abs() <= 2);
+    }
+
+    #[test]
+    fn fixed_length_scales_auto_text_to_fit() {
+        let mut r = Renderer::new();
+        let tape = Tape::tze(12).unwrap();
+        let opts = PageOpts::default();
+        // Long text that would naturally be > 70 mm on 12 mm tape shrinks to fit a 25 mm tube label.
+        let auto_label = Label {
+            blocks: vec![Block::Text(TextBlock {
+                text: "ADAR1 TRPM1 Negative Cntrl Sample 2.1".into(),
+                size_pt: None,
+                ..Default::default()
+            })],
+            fixed_length: true,
+            length_mm: 25.0,
+            ..Default::default()
+        };
+        let out = r.render(&auto_label, &tape, &Vars::default(), &opts);
+        assert!(!out.overflow, "auto-sized text should shrink to fit fixed length");
+        assert!((label_length_mm(&out.bitmap, &opts) - 25.0).abs() < 0.5, "len {}", label_length_mm(&out.bitmap, &opts));
+        assert!(out.bitmap.px.iter().any(|&p| p != 0), "scaled text still renders ink");
+
+        // QR + auto-sized text on 40 mm fixed length: QR stays crisp, text shrinks to fit the remaining width.
+        let combo = Label {
+            blocks: vec![
+                Block::Qr(QrBlock { data: "SAMPLE-2.1".into(), ..Default::default() }),
+                Block::Text(TextBlock { text: "ADAR1 Circular 100nt".into(), size_pt: None, ..Default::default() }),
+            ],
+            fixed_length: true,
+            length_mm: 40.0,
+            ..Default::default()
+        };
+        let out_combo = r.render(&combo, &tape, &Vars::default(), &opts);
+        assert!(!out_combo.overflow, "combo label should scale auto text to fit 40 mm");
+        assert!((label_length_mm(&out_combo.bitmap, &opts) - 40.0).abs() < 0.5);
+
+        // Explicit manual font size does NOT silently override the user's pt size; it still overflows.
+        let manual = Label {
+            blocks: vec![Block::Text(TextBlock {
+                text: "ADAR1 TRPM1 Negative Cntrl Sample 2.1".into(),
+                size_pt: Some(24.0),
+                ..Default::default()
+            })],
+            fixed_length: true,
+            length_mm: 25.0,
+            ..Default::default()
+        };
+        assert!(r.render(&manual, &tape, &Vars::default(), &opts).overflow);
     }
 
     #[test]

@@ -166,7 +166,11 @@ impl BtTransport {
             }
             Some(s) => Ok(s),
             None => {
-                self.drop_port(); // force reconnect next time
+                // Bluetooth: force a reconnect next time. USB: the handle stays valid (unplugging
+                // fails reads/writes), and reopening would orphan the queued read that gets the reply.
+                if !self.usb {
+                    self.drop_port();
+                }
                 bail!("no status reply over {kind}")
             }
         }
@@ -322,6 +326,14 @@ mod tests {
         let mut t = transport(m);
         assert!(t.send_page(&[0x1A], 10.0).is_err());
         assert!(t.port.is_none());
+    }
+
+    #[test]
+    fn usb_keeps_handle_without_reply() {
+        let mut t = transport(Mock::default());
+        t.usb = true;
+        assert!(format!("{:#}", t.status().unwrap_err()).contains("no status reply over USB"));
+        assert!(t.port.is_some());
     }
 
     #[test]

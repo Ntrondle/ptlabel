@@ -1,8 +1,13 @@
 [package]
 name = "ptlabel"
-version = "2.2.1"
+version = "2.3.0"
 edition = "2024"
 description = "Fast label app for Brother P-touch printers (USB, Bluetooth, Wi-Fi)"
+
+[features]
+default = []
+# Yellow dev build: distinct icon/profile, live-reloaded dev-ui.json, in-app UI inspector, no auto-update.
+dev = []
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["wgpu_no_default_features", "persistence", "default_fonts", "clipboard", "system_fonts"] }

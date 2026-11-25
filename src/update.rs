@@ -10,12 +10,65 @@ use std::time::Duration;
 
 const REPO: &str = "Ntrondle/ptlabel";
 
+/// Release notes for a single version in the update changelog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseNote {
+    pub version: String,
+    pub title: String,
+    pub date: String,
+    pub body: String,
+}
+
 /// A release newer than this build.
 #[derive(Debug, Clone)]
 pub struct Release {
     pub version: String,
     /// Download URL of this platform's release asset (DMG on macOS, EXE on Windows).
     asset: String,
+    /// Release page on GitHub, if available.
+    pub html_url: String,
+    /// Changelog entries for every release newer than the running version (newest first).
+    pub notes: Vec<ReleaseNote>,
+}
+
+#[cfg(feature = "dev")]
+impl Release {
+    /// Sample release with changelog for previewing the update dialog in `--features dev`.
+    pub fn dev_preview() -> Self {
+        Self {
+            version: "2.4.0".into(),
+            asset: String::new(),
+            html_url: format!("https://github.com/{REPO}/releases"),
+            notes: vec![
+                ReleaseNote {
+                    version: "2.4.0".into(),
+                    title: "Sample dev preview".into(),
+                    date: "2026-11-25".into(),
+                    body: "\
+### Spreadsheet & Selection
+- **Merged cells:** Automatically fill merged Excel groups so every replicate row gets its cell line and condition.
+- **Smart headers:** Auto-detect the real header row below title banners, with a manual `Headers` selector.
+- **Multi-column insert:** Click multiple column headers in the table and press **Add to label** to insert `{col1} {col2}`.
+- **Drag-paint & group select:** Drag across rows to select ranges, or right-click any cell to select all matching rows.
+
+### Layout & Reliability
+- **Fixed-length auto-scale:** Auto-sized text now scales down smoothly to fit inside fixed-length labels.
+- **Drag & drop:** Drop `.xlsx`, `.csv`, `.ptlabel`, or image files straight onto the window.
+- Fixed a macOS crash when dragging files while a native file picker was open."
+                        .into(),
+                },
+                ReleaseNote {
+                    version: "2.2.1".into(),
+                    title: "Windows USB printer support".into(),
+                    date: "2026-11-24".into(),
+                    body: "\
+- Enumerate connected Brother P-touch USB printers on Windows via SetupAPI (`usbprint.sys`).
+- Overlapped USB read/write transport reusing the bidirectional P-touch protocol."
+                        .into(),
+                },
+            ],
+        }
+    }
 }
 
 /// Remove a `.old` executable left behind by a previous Windows self-update.
@@ -90,11 +143,12 @@ fn asset_matches(name: &str) -> bool {
     }
 }
 
-/// The latest release, if it is newer than this build. Anonymous: 60 requests/hour per IP is
-/// plenty for a check every few hours.
+/// The latest release, if it is newer than this build, along with release notes for every
+/// version between the installed version and the latest release. Anonymous: 60 requests/hour
+/// per IP is plenty for a check every few hours.
 pub fn latest() -> Result<Option<Release>> {
     let v: Value = agent(Duration::from_secs(20))
-        .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .get(format!("https://api.github.com/repos/{REPO}/releases?per_page=10"))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .call()
@@ -102,18 +156,42 @@ pub fn latest() -> Result<Option<Release>> {
         .body_mut()
         .read_json()
         .context("GitHub's reply")?;
-    let version = v["tag_name"].as_str().unwrap_or_default().trim_start_matches('v').to_string();
-    if !newer(&version, env!("CARGO_PKG_VERSION")) {
+    parse_releases(&v, env!("CARGO_PKG_VERSION"))
+}
+
+fn parse_releases(v: &Value, current: &str) -> Result<Option<Release>> {
+    let list = v.as_array().context("GitHub releases list")?;
+    let newer_releases: Vec<&Value> = list
+        .iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false) && !r["prerelease"].as_bool().unwrap_or(false))
+        .filter(|r| {
+            let ver = r["tag_name"].as_str().unwrap_or_default().trim_start_matches('v');
+            newer(ver, current)
+        })
+        .collect();
+    let Some(&top) = newer_releases.first() else {
         return Ok(None);
-    }
-    let asset = v["assets"]
+    };
+    let version = top["tag_name"].as_str().unwrap_or_default().trim_start_matches('v').to_string();
+    let asset = top["assets"]
         .as_array()
         .into_iter()
         .flatten()
         .find(|a| a["name"].as_str().is_some_and(asset_matches))
         .and_then(|a| a["browser_download_url"].as_str())
         .with_context(|| format!("release {version} has no PTLabel package for this OS"))?;
-    Ok(Some(Release { version, asset: asset.into() }))
+    let html_url = top["html_url"].as_str().unwrap_or_default().to_string();
+    let notes = newer_releases
+        .into_iter()
+        .map(|r| {
+            let ver = r["tag_name"].as_str().unwrap_or_default().trim_start_matches('v').to_string();
+            let title = r["name"].as_str().unwrap_or_default().trim().to_string();
+            let date = r["published_at"].as_str().unwrap_or_default().get(..10).unwrap_or("").to_string();
+            let body = r["body"].as_str().unwrap_or_default().trim().to_string();
+            ReleaseNote { version: ver, title, date, body }
+        })
+        .collect();
+    Ok(Some(Release { version, asset: asset.into(), html_url, notes }))
 }
 
 /// `a` is a later version than `b`: "2.0.10" > "2.0.9".
@@ -260,5 +338,55 @@ mod tests {
         assert!(!newer("", "2.0.0"));
         assert!(!newer("v2.0.1", "2.0.0"), "the caller strips the v");
         assert!(!newer("2.0.1-rc1", "2.0.0"));
+    }
+
+    #[test]
+    fn parses_release_notes_since_current() {
+        let asset = if cfg!(target_os = "macos") {
+            "PTLabel.dmg"
+        } else if cfg!(target_arch = "aarch64") {
+            "PTLabel-2.3.0-windows-arm64.exe"
+        } else {
+            "PTLabel-2.3.0-windows-x86_64.exe"
+        };
+        let payload = serde_json::json!([
+            {
+                "tag_name": "v2.3.0",
+                "name": "Release 2.3.0",
+                "published_at": "2026-11-25T08:00:00Z",
+                "html_url": "https://example.com/2.3.0",
+                "body": "- Auto-scale fixed length\n- Better Excel UI",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{ "name": asset, "browser_download_url": "https://example.com/dl" }]
+            },
+            {
+                "tag_name": "v2.2.1",
+                "name": "Release 2.2.1",
+                "published_at": "2026-11-24T08:00:00Z",
+                "body": "- USB support",
+                "draft": false,
+                "prerelease": false,
+                "assets": []
+            },
+            {
+                "tag_name": "v2.2.0",
+                "name": "Release 2.2.0",
+                "published_at": "2026-11-23T08:00:00Z",
+                "body": "- Old release",
+                "draft": false,
+                "prerelease": false,
+                "assets": []
+            }
+        ]);
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            let rel = parse_releases(&payload, "2.2.0").unwrap().unwrap();
+            assert_eq!(rel.version, "2.3.0");
+            assert_eq!(rel.notes.len(), 2);
+            assert_eq!(rel.notes[0].version, "2.3.0");
+            assert_eq!(rel.notes[0].date, "2026-11-25");
+            assert_eq!(rel.notes[1].version, "2.2.1");
+            assert!(parse_releases(&payload, "2.3.0").unwrap().is_none());
+        }
     }
 }

@@ -15,15 +15,27 @@ pub struct DataSource {
     pub path: String,
     /// Sheet name; empty or unknown = first sheet.
     pub sheet: String,
-    /// The first non-empty row (or column when `by_columns`) holds the field names.
+    /// Use a header row (or header column when `by_columns`) for field names.
     pub header: bool,
+    /// Specific 1-based sheet row (or 1-based column when `by_columns`) holding the field names.
+    /// `None` auto-detects the header row (skipping sparse title/note rows above a table).
+    pub header_row: Option<usize>,
+    /// Propagate top-left values across Excel merged cells so every row in a group gets its label.
+    pub fill_merged: bool,
     /// When true, each column is one label (transposed); otherwise each row is one label.
     pub by_columns: bool,
 }
 
 impl Default for DataSource {
     fn default() -> Self {
-        Self { path: String::new(), sheet: String::new(), header: true, by_columns: false }
+        Self {
+            path: String::new(),
+            sheet: String::new(),
+            header: true,
+            header_row: None,
+            fill_merged: true,
+            by_columns: false,
+        }
     }
 }
 
@@ -59,6 +71,13 @@ pub struct Table {
     pub sheet: String,
     pub headers: Arc<Vec<String>>,
     pub rows: Vec<Vec<String>>,
+    /// Parallel to `rows`: true when the cell's value was inherited from a merged range.
+    pub merged: Vec<Vec<bool>>,
+    /// Number of merged regions found in the worksheet (0 for CSV/ODS or unmerged sheets).
+    pub merged_count: usize,
+    /// 1-based sheet row (or 1-based column when `by_columns`) used as the header, if `header` is true.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub header_index: Option<usize>,
     /// Row number ("2", "3", …) or column letter ("A", "B", …) in the spreadsheet, per record.
     pub row_labels: Vec<String>,
     pub mtime: Option<SystemTime>,
@@ -69,7 +88,14 @@ impl Table {
         let values = self.rows.get(i)?.clone();
         Some(Arc::new(Record { headers: self.headers.clone(), values }))
     }
+
+    pub fn is_merged(&self, row: usize, col: usize) -> bool {
+        self.merged.get(row).and_then(|r| r.get(col)).copied().unwrap_or(false)
+    }
 }
+
+/// Inclusive 0-based rectangle in sheet coordinates: `((r0, c0), (r1, c1))`.
+type MergeRect = ((usize, usize), (usize, usize));
 
 pub fn mtime(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
@@ -80,20 +106,31 @@ pub fn load(src: &DataSource) -> Result<Table> {
     // Stat before reading: a save that lands during the read leaves an older mtime, so it reloads again.
     let modified = mtime(&src.path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let (sheets, sheet, grid, first) = if matches!(ext.as_str(), "csv" | "tsv" | "txt") {
+    let (sheets, sheet, grid, first, merges) = if matches!(ext.as_str(), "csv" | "tsv" | "txt") {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        (vec![], String::new(), parse_csv(&decode(&bytes)), (0, 0))
+        (vec![], String::new(), parse_csv(&decode(&bytes)), (0, 0), vec![])
     } else {
         read_sheet(path, &src.sheet)?
     };
-    Ok(build(grid, first, src.header, src.by_columns, sheets, sheet, modified))
+    Ok(build(
+        grid,
+        first,
+        &merges,
+        src.header,
+        src.header_row,
+        src.fill_merged,
+        src.by_columns,
+        sheets,
+        sheet,
+        modified,
+    ))
 }
 
-/// (sheet names, loaded sheet, cells, (row, column) of the first cell).
-type Sheet = (Vec<String>, String, Vec<Vec<String>>, (usize, usize));
+/// (sheet names, loaded sheet, cells, (row, column) of the first cell, merged cell ranges).
+type Sheet = (Vec<String>, String, Vec<Vec<String>>, (usize, usize), Vec<MergeRect>);
 
 fn read_sheet(path: &Path, want: &str) -> Result<Sheet> {
-    use calamine::{Reader, open_workbook_auto};
+    use calamine::{Reader, Sheets, open_workbook_auto};
     let mut wb = open_workbook_auto(path).map_err(|e| anyhow!("{e}"))?;
     let sheets = wb.sheet_names();
     let name = match sheets.iter().find(|s| *s == want) {
@@ -103,7 +140,16 @@ fn read_sheet(path: &Path, want: &str) -> Result<Sheet> {
     let range = wb.worksheet_range(&name).map_err(|e| anyhow!("{e}"))?;
     let first = range.start().map_or((0, 0), |(r, c)| (r as usize, c as usize));
     let grid = range.rows().map(|r| r.iter().map(cell).collect()).collect();
-    Ok((sheets, name, grid, first))
+    let dims = match &mut wb {
+        Sheets::Xlsx(x) => x.merge_cells_by_sheet_name(&name).unwrap_or_default(),
+        Sheets::Xls(x) => x.merge_cells_by_sheet_name(&name).unwrap_or_default(),
+        _ => vec![],
+    };
+    let merges = dims
+        .into_iter()
+        .map(|d| ((d.start.0 as usize, d.start.1 as usize), (d.end.0 as usize, d.end.1 as usize)))
+        .collect();
+    Ok((sheets, name, grid, first, merges))
 }
 
 fn cell(d: &calamine::Data) -> String {
@@ -268,28 +314,126 @@ pub fn col_letter(mut i: usize) -> String {
     String::from_utf8(s).unwrap()
 }
 
+/// True when `s` looks like a numeric literal rather than a text header name.
+fn looks_numeric(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty() && t.replace(',', ".").parse::<f64>().is_ok()
+}
+
+/// Pick which entry of `records` holds the headers:
+/// - Explicit `header_row` selects the entry with that 1-based sheet index (fallback: 0).
+/// - `None` (Auto) picks row 0 unless row 0 is a sparse banner/title (≤ 2 filled cells or less than
+///   half as wide as a header-like text row below it) with data rows underneath.
+fn pick_header_pos(records: &[(usize, Vec<String>, Vec<bool>)], header_row: Option<usize>) -> usize {
+    if records.is_empty() {
+        return 0;
+    }
+    if let Some(want) = header_row
+        && let Some(pos) = records.iter().position(|(n, _, _)| *n == want)
+    {
+        return pos;
+    }
+    let stats = |r: &[String]| -> (usize, usize) {
+        let mut filled = 0;
+        let mut text = 0;
+        for c in r {
+            let t = c.trim();
+            if !t.is_empty() {
+                filled += 1;
+                if !looks_numeric(t) {
+                    text += 1;
+                }
+            }
+        }
+        (filled, text)
+    };
+    let (f0, _) = stats(&records[0].1);
+    let scan_end = records.len().saturating_sub(1).min(10);
+    for (k, (_, cells, _)) in records.iter().enumerate().take(scan_end).skip(1) {
+        let (fk, tk) = stats(cells);
+        // Header row should have ≥3 filled cells, be mostly text, and at least 2× wider than a sparse banner above it.
+        if fk >= 3 && tk * 5 >= fk * 3 && f0 * 2 <= fk {
+            return k;
+        }
+    }
+    0
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build(
-    grid: Vec<Vec<String>>,
-    (first_row, first_col): (usize, usize),
+    mut grid: Vec<Vec<String>>,
+    (first_row, mut first_col): (usize, usize),
+    merges: &[MergeRect],
     header: bool,
+    header_row: Option<usize>,
+    fill_merged: bool,
     by_columns: bool,
     sheets: Vec<String>,
     sheet: String,
     mtime: Option<SystemTime>,
 ) -> Table {
-    let mut non_empty_rows: Vec<(usize, Vec<String>)> = grid
+    let rows_len = grid.len();
+    let max_cols = grid.iter().map(Vec::len).max().unwrap_or(0);
+    for r in &mut grid {
+        r.resize(max_cols, String::new());
+    }
+    let mut merged_grid: Vec<Vec<bool>> = vec![vec![false; max_cols]; rows_len];
+    if fill_merged && rows_len > 0 && max_cols > 0 {
+        for &((r0, c0), (r1, c1)) in merges {
+            if r0 < first_row || c0 < first_col {
+                continue;
+            }
+            let (lr0, lc0) = (r0 - first_row, c0 - first_col);
+            if lr0 >= rows_len || lc0 >= max_cols {
+                continue;
+            }
+            let val = grid[lr0][lc0].clone();
+            if val.trim().is_empty() {
+                continue;
+            }
+            let lr1 = r1.saturating_sub(first_row).min(rows_len - 1);
+            let lc1 = c1.saturating_sub(first_col).min(max_cols - 1);
+            for r in lr0..=lr1 {
+                for c in lc0..=lc1 {
+                    if (r, c) != (lr0, lc0) && grid[r][c].trim().is_empty() {
+                        grid[r][c] = val.clone();
+                        merged_grid[r][c] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut non_empty_rows: Vec<(usize, Vec<String>, Vec<bool>)> = grid
         .into_iter()
+        .zip(merged_grid)
         .enumerate()
-        .map(|(i, r)| (first_row + i + 1, r))
-        .filter(|(_, r)| r.iter().any(|c| !c.trim().is_empty()))
+        .map(|(i, (r, m))| (first_row + i + 1, r, m))
+        .filter(|(_, r, _)| r.iter().any(|c| !c.trim().is_empty()))
         .collect();
-    let width = non_empty_rows
+
+    // Trim completely empty leading & trailing columns while preserving sheet column letters.
+    let min_col = non_empty_rows
         .iter()
-        .filter_map(|(_, r)| r.iter().rposition(|c| !c.trim().is_empty()))
+        .filter_map(|(_, r, _)| r.iter().position(|c| !c.trim().is_empty()))
+        .min()
+        .unwrap_or(0);
+    let max_col = non_empty_rows
+        .iter()
+        .filter_map(|(_, r, _)| r.iter().rposition(|c| !c.trim().is_empty()))
         .max()
         .map_or(0, |p| p + 1);
-    for (_, r) in &mut non_empty_rows {
+    let width = max_col.saturating_sub(min_col);
+    first_col += min_col;
+    for (_, r, m) in &mut non_empty_rows {
+        if min_col > 0 && min_col <= r.len() {
+            r.drain(..min_col);
+            m.drain(..min_col);
+        }
+        r.truncate(width);
+        m.truncate(width);
         r.resize(width, String::new());
+        m.resize(width, false);
     }
 
     let sanitize = |s: String, fallback: String| -> String {
@@ -297,38 +441,49 @@ fn build(
         if s.is_empty() { fallback } else { s }
     };
 
-    let (mut records, mut headers): (Vec<(String, Vec<String>)>, Vec<String>) = if by_columns {
-        let row_nums: Vec<usize> = non_empty_rows.iter().map(|(n, _)| *n).collect();
-        let mut cols: Vec<(String, Vec<String>)> = (0..width)
+    type BuiltRow = (String, Vec<String>, Vec<bool>);
+    let (records, mut headers, header_index): (Vec<BuiltRow>, Vec<String>, Option<usize>) = if by_columns {
+        let row_nums: Vec<usize> = non_empty_rows.iter().map(|(n, _, _)| *n).collect();
+        let mut cols: Vec<(usize, Vec<String>, Vec<bool>)> = (0..width)
             .map(|c| {
-                let col: Vec<String> = non_empty_rows.iter().map(|(_, r)| r[c].clone()).collect();
-                (col_letter(first_col + c), col)
+                let col: Vec<String> = non_empty_rows.iter().map(|(_, r, _)| r[c].clone()).collect();
+                let mcol: Vec<bool> = non_empty_rows.iter().map(|(_, _, m)| m[c]).collect();
+                (first_col + c + 1, col, mcol)
             })
-            .filter(|(_, col)| col.iter().any(|v| !v.trim().is_empty()))
+            .filter(|(_, col, _)| col.iter().any(|v| !v.trim().is_empty()))
             .collect();
-        let headers = if header && !cols.is_empty() {
-            let (_, h) = cols.remove(0);
-            h.into_iter()
+        if header && !cols.is_empty() {
+            let pos = pick_header_pos(&cols, header_row);
+            let (hdr_n, h, _) = cols.remove(pos);
+            cols.drain(..pos);
+            let headers = h
+                .into_iter()
                 .enumerate()
                 .map(|(i, s)| sanitize(s, format!("Row {}", row_nums[i])))
-                .collect()
+                .collect();
+            let recs = cols.into_iter().map(|(n, c, m)| (col_letter(n - 1), c, m)).collect();
+            (recs, headers, Some(hdr_n))
         } else {
-            row_nums.iter().map(|n| format!("Row {n}")).collect()
-        };
-        (cols, headers)
+            let headers = row_nums.iter().map(|n| format!("Row {n}")).collect();
+            let recs = cols.into_iter().map(|(n, c, m)| (col_letter(n - 1), c, m)).collect();
+            (recs, headers, None)
+        }
+    } else if header && !non_empty_rows.is_empty() {
+        let pos = pick_header_pos(&non_empty_rows, header_row);
+        let (hdr_n, h, _) = non_empty_rows.remove(pos);
+        // Skip banner/title rows above the header row.
+        non_empty_rows.drain(..pos);
+        let headers = h
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| sanitize(s, col_letter(first_col + i)))
+            .collect();
+        let recs = non_empty_rows.into_iter().map(|(n, r, m)| (n.to_string(), r, m)).collect();
+        (recs, headers, Some(hdr_n))
     } else {
-        let mut rows: Vec<(String, Vec<String>)> =
-            non_empty_rows.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
-        let headers = if header && !rows.is_empty() {
-            let (_, h) = rows.remove(0);
-            h.into_iter()
-                .enumerate()
-                .map(|(i, s)| sanitize(s, col_letter(first_col + i)))
-                .collect()
-        } else {
-            (0..width).map(|i| col_letter(first_col + i)).collect()
-        };
-        (rows, headers)
+        let headers = (0..width).map(|i| col_letter(first_col + i)).collect();
+        let recs = non_empty_rows.into_iter().map(|(n, r, m)| (n.to_string(), r, m)).collect();
+        (recs, headers, None)
     };
 
     // Duplicate names get " 2", " 3"… so every field can be addressed.
@@ -340,18 +495,39 @@ fn build(
             k += 1;
         }
     }
-    let (row_labels, rows) = records.drain(..).unzip();
-    Table { sheets, sheet, headers: Arc::new(headers), rows, row_labels, mtime }
+    let mut row_labels = Vec::with_capacity(records.len());
+    let mut rows = Vec::with_capacity(records.len());
+    let mut merged = Vec::with_capacity(records.len());
+    for (lbl, r, m) in records {
+        row_labels.push(lbl);
+        rows.push(r);
+        merged.push(m);
+    }
+    Table {
+        sheets,
+        sheet,
+        headers: Arc::new(headers),
+        rows,
+        merged,
+        merged_count: merges.len(),
+        header_index,
+        row_labels,
+        mtime,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn build_simple(grid: Vec<Vec<String>>, first: (usize, usize), header: bool, by_columns: bool) -> Table {
+        build(grid, first, &[], header, None, true, by_columns, vec![], String::new(), None)
+    }
+
     #[test]
     fn csv_quotes_delimiters_and_headers() {
         let g = parse_csv("Part;Value;Note\r\nR1;10k;\"say \"\"hi\"\"; ok\"\n\nC1;100n;\"two\nlines\"\n");
-        let t = build(g, (0, 0), true, false, vec![], String::new(), None);
+        let t = build_simple(g, (0, 0), true, false);
         assert_eq!(*t.headers, vec!["Part", "Value", "Note"]);
         assert_eq!(t.rows[0], vec!["R1", "10k", "say \"hi\"; ok"]);
         assert_eq!(t.rows[1][2], "two\nlines");
@@ -364,7 +540,7 @@ mod tests {
     #[test]
     fn letters_dupes_and_numbers() {
         assert_eq!((col_letter(0), col_letter(25), col_letter(26), col_letter(701)), ("A".into(), "Z".into(), "AA".into(), "ZZ".into()));
-        let t = build(vec![vec!["X".into(), "".into(), "X".into()], vec!["1".into(), "2".into(), "3".into()]], (4, 0), true, false, vec![], String::new(), None);
+        let t = build_simple(vec![vec!["X".into(), "".into(), "X".into()], vec!["1".into(), "2".into(), "3".into()]], (4, 0), true, false);
         assert_eq!(*t.headers, vec!["X", "B", "X 2"]);
         assert_eq!(t.row_labels, vec!["6"]);
         assert_eq!((number(1001.0), number(0.1 + 0.2), number(2.5)), ("1001".into(), "0.3".into(), "2.5".into()));
@@ -421,24 +597,50 @@ mod tests {
     #[test]
     fn column_letters_follow_the_sheet_offset() {
         let g = || vec![vec!["".to_string(), "Qty".into()], vec!["R1".into(), "5".into()]];
-        assert_eq!(*build(g(), (2, 2), true, false, vec![], String::new(), None).headers, vec!["C", "Qty"]);
-        assert_eq!(*build(g(), (2, 2), false, false, vec![], String::new(), None).headers, vec!["C", "D"]);
+        assert_eq!(*build_simple(g(), (2, 2), true, false).headers, vec!["C", "Qty"]);
+        assert_eq!(*build_simple(g(), (2, 2), false, false).headers, vec!["C", "D"]);
     }
 
     #[test]
     fn by_columns_transposes_sheet_with_or_without_header() {
         let g = || parse_csv("Field;Tube 1;Tube 2\nConc;10 mM;20 mM\n;extra;note\n");
-        let with_hdr = build(g(), (0, 0), true, true, vec![], String::new(), None);
+        let with_hdr = build_simple(g(), (0, 0), true, true);
         assert_eq!(*with_hdr.headers, vec!["Field", "Conc", "Row 3"]);
         assert_eq!(with_hdr.row_labels, vec!["B", "C"]);
         assert_eq!(with_hdr.rows[0], vec!["Tube 1", "10 mM", "extra"]);
         assert_eq!(with_hdr.rows[1], vec!["Tube 2", "20 mM", "note"]);
         assert_eq!(with_hdr.record(1).unwrap().get("Conc"), Some("20 mM"));
 
-        let no_hdr = build(g(), (1, 2), false, true, vec![], String::new(), None);
+        let no_hdr = build_simple(g(), (1, 2), false, true);
         assert_eq!(*no_hdr.headers, vec!["Row 2", "Row 3", "Row 4"]);
         assert_eq!(no_hdr.row_labels, vec!["C", "D", "E"]);
         assert_eq!(no_hdr.rows[0], vec!["Field", "Conc", ""]);
+    }
+
+    #[test]
+    fn fills_merged_cells_and_auto_detects_header_below_banner() {
+        let s = |v: &str| v.to_string();
+        // Mirrors lab sheets: empty col A, banner on row 2 (H2:I2), real header on row 3, merged groups in B & C.
+        let grid = vec![
+            vec![s(""), s(""), s(""), s(""), s("60 ng/uL")],
+            vec![s(""), s("Cell line"), s("Condition"), s("Sample ID"), s("RNA")],
+            vec![s(""), s("ADAR1"), s("NT (+Dox)"), s("Sample 1.1"), s("311.92")],
+            vec![s(""), s(""), s(""), s("Sample 1.2"), s("186.32")],
+            vec![s(""), s(""), s("TRPM1\nNeg"), s("Sample 2.1"), s("326.76")],
+        ];
+        // Sheet starts at row 1 (Excel row 2), col 0 (Excel col A).
+        let merges = vec![((3, 1), (5, 1)), ((3, 2), (4, 2))];
+        let t = build(grid, (1, 0), &merges, true, None, true, false, vec![], String::new(), None);
+        assert_eq!(t.header_index, Some(3));
+        assert_eq!(*t.headers, vec!["Cell line", "Condition", "Sample ID", "RNA"]);
+        assert_eq!(t.row_labels, vec!["4", "5", "6"]);
+        assert_eq!(t.rows[0], vec!["ADAR1", "NT (+Dox)", "Sample 1.1", "311.92"]);
+        assert_eq!(t.rows[1], vec!["ADAR1", "NT (+Dox)", "Sample 1.2", "186.32"]);
+        assert_eq!(t.rows[2], vec!["ADAR1", "TRPM1\nNeg", "Sample 2.1", "326.76"]);
+        assert!(!t.is_merged(0, 0));
+        assert!(t.is_merged(1, 0));
+        assert!(t.is_merged(1, 1));
+        assert!(!t.is_merged(2, 1));
     }
 
     #[test]

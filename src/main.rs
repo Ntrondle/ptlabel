@@ -3,6 +3,7 @@
 mod app;
 mod cli;
 mod data;
+mod dev_ui;
 mod history;
 mod icons;
 mod job;

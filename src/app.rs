@@ -1,6 +1,7 @@
 //! egui front end: printer bar, live preview, block editor, print panel.
 
 use crate::data::{self, DataSource, Record, Table};
+use crate::dev_ui::{DevUi, UiConfig};
 use crate::history::{self, History};
 use crate::job::{Pager, PrintJob, PrintSettings};
 use crate::label::render::{PREVIEW_SCALE, Renderer, canvas_length_mm, preview_smooth, save_png};
@@ -26,9 +27,13 @@ use std::time::{Duration, Instant};
 
 const KEY: &str = "ptlabel";
 
-/// Dock/window icon when running outside the .app bundle (the bundle uses PTLabel.icns).
+/// Dock/window icon when running outside the .app bundle (the bundle uses PTLabel.icns / PTLabel-Dev.icns).
 fn window_icon() -> egui::IconData {
-    let img = image::load_from_memory(include_bytes!("../assets/icon.png")).expect("icon.png").to_rgba8();
+    #[cfg(feature = "dev")]
+    let bytes: &[u8] = include_bytes!("../assets/icon-dev.png");
+    #[cfg(not(feature = "dev"))]
+    let bytes: &[u8] = include_bytes!("../assets/icon.png");
+    let img = image::load_from_memory(bytes).expect("icon.png").to_rgba8();
     egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
 }
 
@@ -36,6 +41,7 @@ fn window_icon() -> egui::IconData {
 fn app_name() -> String {
     match std::env::var("PTLABEL_PROFILE") {
         Ok(p) if !p.is_empty() => format!("PTLabel-{p}"),
+        _ if cfg!(feature = "dev") => "PTLabel Dev".to_string(),
         _ => "PTLabel".to_string(),
     }
 }
@@ -211,6 +217,9 @@ pub struct App {
     /// Preview render running on a worker thread.
     preview_job: Option<crossbeam_channel::Receiver<Preview>>,
     new_host: String,
+    /// Scratch buffer & open-state tracker for the Fixed-length typing + presets dropdown.
+    length_input: String,
+    length_popup_was_open: bool,
     notify: Arc<dyn Fn() + Send + Sync>,
     speller: Speller,
     menu_rx: Option<crossbeam_channel::Receiver<MenuCmd>>,
@@ -228,14 +237,24 @@ pub struct App {
     table: Option<Table>,
     table_err: Option<String>,
     table_filter: String,
+    /// Staged field names for multi-field insertion (`{col1} {col2}…`).
+    picked_fields: Vec<String>,
+    /// Last text block focused/edited (target for "Add to label").
+    active_text_block: Option<usize>,
+    /// Active drag-paint selection state in the spreadsheet table (`Some(true)` = selecting).
+    table_drag: Option<bool>,
     /// Row shown in the preview (last clicked).
     preview_row: Option<usize>,
-    /// Last clicked sheet row (index into `table.rows`), for ⇧-click ranges.
+    /// Last clicked sheet row (index into `table.rows`), for ⇧-click ranges and drag painting.
     last_click: Option<usize>,
     data_checked: Instant,
     /// Minimized state for the spreadsheet box and each block box.
     data_collapsed: bool,
     collapsed: Vec<bool>,
+    /// Native file dialogs run off the UI frame (avoids macOS winit re-entrancy crashes).
+    dialog_rx: crossbeam_channel::Receiver<DialogRes>,
+    dialog_tx: crossbeam_channel::Sender<DialogRes>,
+    dialog_busy: Arc<std::sync::atomic::AtomicBool>,
     /// The label as last opened/saved (or new); differs from `p.label` = unsaved changes.
     saved: Label,
     /// A newer release on GitHub ("Update to …" in the status bar), its modal, and install state.
@@ -246,6 +265,29 @@ pub struct App {
     /// The last look for a newer release; update checks and installs answer on `upd`.
     checked: Option<Instant>,
     upd: (crossbeam_channel::Sender<Upd>, crossbeam_channel::Receiver<Upd>),
+    /// Live UI config (`dev-ui.json` watcher + Dev Inspector in `--features dev` builds).
+    dev: DevUi,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InsertMode {
+    Append,
+    NewBlock,
+}
+
+enum TableAction {
+    None,
+    ToggleHeader(String),
+    AddToLabel,
+    UseHeaderRow(usize),
+}
+
+enum DialogRes {
+    PickData { path: std::path::PathBuf, add_field: bool },
+    OpenLabel(std::path::PathBuf),
+    SaveLabel(std::path::PathBuf),
+    ExportPng(std::path::PathBuf),
+    PickImage { block: usize, path: std::path::PathBuf },
 }
 
 enum Upd {
@@ -256,8 +298,6 @@ enum Upd {
 
 /// How often a running app looks for a new release.
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
-
-const ACCENT: Color32 = Color32::from_rgb(58, 123, 234);
 
 fn rgb(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
@@ -270,6 +310,18 @@ impl App {
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
         let renderer = Renderer::new();
         let fonts = renderer.families();
+        if let Some((bytes, index)) = renderer.bold_ui_font() {
+            let mut fd = egui::FontData::from_owned(bytes);
+            fd.index = index;
+            cc.egui_ctx.add_font(egui::epaint::text::FontInsert::new(
+                "ui_bold",
+                fd,
+                vec![egui::epaint::text::InsertFontFamily {
+                    family: egui::FontFamily::Name("bold".into()),
+                    priority: egui::epaint::text::FontPriority::Highest,
+                }],
+            ));
+        }
         let discovered = Arc::new(Mutex::new(vec![]));
         {
             let (d, n) = (discovered.clone(), notify.clone());
@@ -299,6 +351,8 @@ impl App {
             preview: None,
             preview_job: None,
             new_host: String::new(),
+            length_input: String::new(),
+            length_popup_was_open: false,
             notify,
             speller: Speller::new(),
             menu_rx: crate::menu::install(&cc.egui_ctx),
@@ -310,11 +364,24 @@ impl App {
             table: None,
             table_err: None,
             table_filter: String::new(),
+            picked_fields: vec![],
+            active_text_block: None,
+            table_drag: None,
             preview_row: None,
             last_click: None,
             data_checked: Instant::now(),
             data_collapsed: false,
             collapsed: vec![],
+            dialog_rx: {
+                // replaced right below with matched pair
+                let (_, rx) = crossbeam_channel::unbounded();
+                rx
+            },
+            dialog_tx: {
+                let (tx, _) = crossbeam_channel::unbounded();
+                tx
+            },
+            dialog_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saved: Label::default(),
             update: None,
             update_modal: false,
@@ -322,7 +389,11 @@ impl App {
             update_error: None,
             checked: None,
             upd: crossbeam_channel::unbounded(),
+            dev: DevUi::new(),
         };
+        let (dialog_tx, dialog_rx) = crossbeam_channel::unbounded();
+        app.dialog_tx = dialog_tx;
+        app.dialog_rx = dialog_rx;
         // Restored label vs. its file on disk (missing/unreadable file = unsaved).
         if let Some(l) = app.p.doc_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()) {
             app.saved = l;
@@ -431,13 +502,8 @@ impl App {
             match ev {
                 Event::Status(s) => {
                     let t = s.tape();
-                    let key = |t: &Tape| (t.width_code, t.kind, t.tape_color, t.text_color);
-                    if t.as_ref().map(key) != self.live_tape.as_ref().map(key) {
-                        match (&self.live_tape, &t) {
-                            (_, Some(t)) => self.info(format!("Tape detected: {}", t.describe())),
-                            (Some(_), None) => self.info("Tape removed".into()),
-                            _ => {}
-                        }
+                    if self.live_tape.is_some() && t.is_none() {
+                        self.info("Tape removed".into());
                     }
                     self.live_tape = t;
                     if let Some(m) = s.model_name() {
@@ -484,9 +550,9 @@ impl App {
 
     // ---------------------------------------------------------------- updates
 
-    /// Look for a newer release now and then (only an app bundle can update itself).
+    /// Look for a newer release now and then (only an app bundle can update itself; disabled in dev).
     fn check_update(&mut self, ctx: &egui::Context) {
-        if self.checked.is_some_and(|t| t.elapsed() < UPDATE_EVERY) || crate::update::bundle().is_none() {
+        if cfg!(feature = "dev") || self.checked.is_some_and(|t| t.elapsed() < UPDATE_EVERY) || crate::update::bundle().is_none() {
             return;
         }
         self.checked = Some(Instant::now());
@@ -552,6 +618,8 @@ impl App {
             self.update_modal = false;
             return;
         };
+        let is_dev_preview = cfg!(feature = "dev") && self.dev.cfg.preview_update_modal;
+        let accent = self.dev.cfg.accent();
         let printing = self.printing();
         let (mut close, mut install) = (false, false);
         let style = ctx.global_style();
@@ -561,50 +629,100 @@ impl App {
             .corner_radius(10)
             .inner_margin(egui::Margin::same(24));
         let resp = egui::Modal::new(egui::Id::unique("update")).frame(frame).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.label(RichText::new("Update available").strong().size(20.0));
-            ui.add_space(12.0);
-            ui.label(format!("PTLabel {} is ready to install.", r.version));
-            ui.add_space(6.0);
+            let body_sz = self.dev.cfg.changelog_font_size;
+            ui.set_width(self.dev.cfg.update_modal_width);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Installed").small().weak());
-                ui.label(RichText::new(env!("CARGO_PKG_VERSION")).small().monospace().weak());
-                ui.label(RichText::new("→").small().weak());
-                ui.label(RichText::new("New").small().weak());
-                ui.label(RichText::new(&r.version).small().monospace().strong().color(ACCENT));
+                ui.label(RichText::new("Update available").strong().size(22.0));
+                if is_dev_preview {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(248, 204, 56))
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::symmetric(6, 2))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("DEV PREVIEW").strong().size(11.0).color(Color32::from_rgb(28, 37, 51)));
+                        });
+                }
             });
-            ui.add_space(12.0);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("PTLabel {} is ready to install.", r.version)).size(15.0));
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Installed").size(13.5).weak());
+                ui.label(RichText::new(env!("CARGO_PKG_VERSION")).size(13.5).monospace().weak());
+                ui.label(RichText::new("→").size(13.5).weak());
+                ui.label(RichText::new("New").size(13.5).weak());
+                ui.label(RichText::new(&r.version).size(13.5).monospace().strong().color(accent));
+            });
+
+            if !r.notes.is_empty() {
+                ui.add_space(14.0);
+                ui.label(RichText::new("What's new").strong().size((body_sz + 1.0).max(15.0)));
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(ui.visuals().faint_bg_color)
+                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .id_salt("update_changelog")
+                            .max_height(320.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                changelog_ui(ui, &r.notes, accent, body_sz);
+                            });
+                    });
+            }
+
+            ui.add_space(14.0);
             if self.updating {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.weak("Downloading and installing…");
+                    ui.label(RichText::new("Downloading and installing…").size(14.0).weak());
                 });
             } else if printing {
-                ui.label(RichText::new("Printing: update once the queue is done.").small().color(Color32::from_rgb(230, 150, 20)));
+                ui.label(RichText::new("Printing: update once the queue is done.").size(13.5).color(Color32::from_rgb(230, 150, 20)));
             } else {
-                ui.label(RichText::new("PTLabel will download the update, replace the app, and reopen automatically.").small().weak());
+                ui.label(RichText::new("PTLabel will download the update, replace the app, and reopen automatically.").size(13.5).weak());
             }
             if let Some(e) = &self.update_error {
                 ui.add_space(8.0);
-                ui.label(RichText::new(e).small().color(Color32::from_rgb(220, 60, 50)));
+                ui.label(RichText::new(e).size(13.5).color(Color32::from_rgb(220, 60, 50)));
             }
             ui.add_space(16.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if self.updating { "Updating…" } else { "Update now" };
-                let primary = egui::Button::new(RichText::new(label).color(Color32::WHITE).strong()).fill(ACCENT);
-                if ui.add_enabled(!self.updating && !printing, primary).clicked() {
-                    install = true;
+            ui.horizontal(|ui| {
+                if !r.html_url.is_empty() {
+                    ui.hyperlink_to(RichText::new("Release notes on GitHub ↗").size(13.5), &r.html_url);
                 }
-                if ui.add_enabled(!self.updating, egui::Button::new("Later")).clicked() {
-                    close = true;
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if self.updating { "Updating…" } else { "Update now" };
+                    let primary = egui::Button::new(RichText::new(label).size(14.5).color(Color32::WHITE).strong()).fill(accent);
+                    if ui.add_enabled(!self.updating && !printing, primary).clicked() {
+                        install = true;
+                    }
+                    if ui.add_enabled(!self.updating, egui::Button::new(RichText::new("Later").size(14.5))).clicked() {
+                        close = true;
+                    }
+                });
             });
         });
         if install {
-            self.update_error = None;
-            self.start_update(ctx);
+            if is_dev_preview {
+                self.info("Dev preview: update install skipped".into());
+                self.update_modal = false;
+                #[cfg(feature = "dev")]
+                self.dev.set_update_preview(false);
+            } else {
+                self.update_error = None;
+                self.start_update(ctx);
+            }
         } else if !self.updating && (close || resp.should_close()) {
             self.update_modal = false;
+            #[cfg(feature = "dev")]
+            self.dev.set_update_preview(false);
         }
     }
 
@@ -670,12 +788,86 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------- dialogs & drag-drop
+
+    /// Run a native file dialog off the UI frame. On macOS, calling `rfd::FileDialog`
+    /// synchronously inside `App::ui` runs a nested `NSApplication` modal loop inside winit's
+    /// event handler, which panics if a drag or repaint event re-enters winit.
+    fn spawn_dialog(&self, ctx: &egui::Context, f: impl FnOnce() -> Option<DialogRes> + Send + 'static) {
+        use std::sync::atomic::Ordering;
+        if self.dialog_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let tx = self.dialog_tx.clone();
+        let busy = self.dialog_busy.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let res = f();
+            busy.store(false, Ordering::Release);
+            if let Some(r) = res {
+                let _ = tx.send(r);
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn pump_dialogs(&mut self) {
+        let msgs: Vec<DialogRes> = self.dialog_rx.try_iter().collect();
+        for res in msgs {
+            match res {
+                DialogRes::PickData { path, add_field } => self.attach_data_path(path, add_field),
+                DialogRes::OpenLabel(path) => self.open_path(path),
+                DialogRes::SaveLabel(path) => self.save_to(path),
+                DialogRes::ExportPng(path) => self.export_png_to(path),
+                DialogRes::PickImage { block, path } => {
+                    if let Some(Block::Image(im)) = self.p.label.blocks.get_mut(block) {
+                        im.path = path.display().to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
+        });
+        for path in dropped {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if data::EXTENSIONS.contains(&ext.as_str()) {
+                self.attach_data_path(path, false);
+                break;
+            } else if matches!(ext.as_str(), "ptlabel" | "json") {
+                self.open_path(path);
+                break;
+            } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
+                self.p.label.blocks.push(Block::Image(ImageBlock { path: path.display().to_string(), ..Default::default() }));
+                self.collapsed.push(false);
+                break;
+            }
+        }
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if hovering {
+            let screen = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop_overlay")));
+            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(150));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop spreadsheet (.xlsx / .csv), .ptlabel, or image to open",
+                FontId::proportional(20.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
     // ---------------------------------------------------------------- spreadsheet
 
     fn reload_table(&mut self) {
         let Some(src) = &self.p.label.data else {
             self.table = None;
             self.table_err = None;
+            self.picked_fields.clear();
             return;
         };
         match data::load(src) {
@@ -689,6 +881,7 @@ impl App {
                 if self.preview_row.is_some_and(|r| r >= n) {
                     self.preview_row = None;
                 }
+                self.picked_fields.retain(|f| t.headers.iter().any(|h| h == f));
                 self.table = Some(t);
                 self.table_err = None;
             }
@@ -699,29 +892,107 @@ impl App {
         }
     }
 
-    fn pick_data_file(&mut self) -> bool {
-        let Some(path) = rfd::FileDialog::new().add_filter("Spreadsheet", data::EXTENSIONS).pick_file() else {
-            return false;
-        };
+    fn attach_data_path(&mut self, path: std::path::PathBuf, add_field: bool) {
         self.p.label.data = Some(DataSource { path: path.display().to_string(), ..Default::default() });
         self.p.sel_rows.clear();
         self.preview_row = None;
         self.last_click = None;
+        self.table_drag = None;
         self.table_filter.clear();
+        self.picked_fields.clear();
+        self.data_collapsed = false;
         self.reload_table();
-        self.table.is_some()
+        let summary = self
+            .table
+            .as_ref()
+            .map(|t| (t.rows.len(), t.headers.len(), t.headers.first().cloned()));
+        if let Some((nrows, ncols, first_col)) = summary {
+            self.info(format!(
+                "Loaded {} ({nrows} rows, {ncols} fields)",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            // Only auto-add a field if the user explicitly clicked Excel when there are no text blocks yet.
+            if add_field && self.p.label.blocks.is_empty() && let Some(c) = first_col {
+                self.p.label.blocks.push(Block::Text(TextBlock { text: format!("{{{c}}}"), ..Default::default() }));
+                self.collapsed.push(false);
+            }
+        }
     }
 
-    /// "Excel" in the Add row: attach a spreadsheet (first time), then add a text
-    /// block showing the next column that isn't on the label yet.
-    fn add_excel(&mut self) {
-        if self.p.label.data.is_none() && !self.pick_data_file() {
+    fn pick_data_file(&mut self, ctx: &egui::Context, add_field: bool) {
+        self.spawn_dialog(ctx, move || {
+            rfd::FileDialog::new()
+                .add_filter("Spreadsheet", data::EXTENSIONS)
+                .pick_file()
+                .map(|path| DialogRes::PickData { path, add_field })
+        });
+    }
+
+    /// "Excel" in the Add row: attach a spreadsheet (first time), or add the picked/next column(s).
+    fn add_excel(&mut self, ctx: &egui::Context) {
+        if self.p.label.data.is_none() {
+            self.pick_data_file(ctx, true);
+            return;
+        }
+        if !self.picked_fields.is_empty() {
+            self.insert_picked_fields(InsertMode::NewBlock);
             return;
         }
         let Some(t) = &self.table else { return };
         let col = t.headers.iter().find(|h| !self.p.label.uses(h)).or(t.headers.first()).cloned();
         if let Some(c) = col {
             self.p.label.blocks.push(Block::Text(TextBlock { text: format!("{{{c}}}"), ..Default::default() }));
+            self.collapsed.push(false);
+        }
+    }
+
+    fn insert_picked_fields(&mut self, mode: InsertMode) {
+        if self.picked_fields.is_empty() {
+            return;
+        }
+        let snippet: String = self
+            .picked_fields
+            .iter()
+            .map(|h| format!("{{{h}}}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let target_idx = self
+            .active_text_block
+            .filter(|&i| matches!(self.p.label.blocks.get(i), Some(Block::Text(_))))
+            .or_else(|| self.p.label.blocks.iter().position(|b| matches!(b, Block::Text(_))));
+        match mode {
+            InsertMode::NewBlock => {
+                self.p.label.blocks.push(Block::Text(TextBlock { text: snippet, ..Default::default() }));
+                self.collapsed.push(false);
+                self.active_text_block = Some(self.p.label.blocks.len() - 1);
+            }
+            InsertMode::Append => {
+                if let Some(i) = target_idx {
+                    if let Block::Text(t) = &mut self.p.label.blocks[i] {
+                        if t.text.trim().is_empty() || t.text.trim() == "Label" {
+                            t.text = snippet;
+                        } else {
+                            if !t.text.ends_with([' ', '\n']) {
+                                t.text.push(' ');
+                            }
+                            t.text.push_str(&snippet);
+                        }
+                    }
+                    self.active_text_block = Some(i);
+                } else {
+                    self.p.label.blocks.push(Block::Text(TextBlock { text: snippet, ..Default::default() }));
+                    self.collapsed.push(false);
+                    self.active_text_block = Some(self.p.label.blocks.len() - 1);
+                }
+            }
+        }
+    }
+
+    fn toggle_picked_field(&mut self, name: &str) {
+        if let Some(pos) = self.picked_fields.iter().position(|h| h == name) {
+            self.picked_fields.remove(pos);
+        } else {
+            self.picked_fields.push(name.to_string());
         }
     }
 
@@ -753,15 +1024,17 @@ impl App {
         Pager::new(&self.p.label, &self.p.settings, row.into_iter().collect()).record_vars(k as u64)
     }
 
-    fn data_panel(&mut self, ui: &mut egui::Ui) {
+    fn data_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let Some(src) = self.p.label.data.clone() else { return };
         enum DAct {
             Change,
             Reload,
             Remove,
             Sheet(String),
-            Header(bool),
-            ByColumns(bool),
+            HeaderRow(usize),
+            FillMerged(bool),
+            ToggleField(String),
+            Insert(InsertMode),
         }
         let mut act: Option<DAct> = None;
         let units = if src.by_columns { "columns" } else { "rows" };
@@ -791,8 +1064,10 @@ impl App {
                 });
             });
             if !self.data_collapsed {
-                ui.horizontal_wrapped(|ui| {
-                    if let Some(t) = &self.table {
+                if let Some(t) = &self.table
+                    && (t.sheets.len() > 1 || t.merged_count > 0)
+                {
+                    ui.horizontal_wrapped(|ui| {
                         if t.sheets.len() > 1 {
                             ComboBox::from_id_salt("sheet").selected_text(&t.sheet).show_ui(ui, |ui| {
                                 for sh in &t.sheets {
@@ -802,25 +1077,25 @@ impl App {
                                 }
                             });
                         }
-                    }
-                    ui.label("Select");
-                    let mut by_cols = src.by_columns;
-                    if ui.selectable_value(&mut by_cols, false, "Rows").on_hover_text("Each selected row prints one label").changed()
-                        || ui.selectable_value(&mut by_cols, true, "Columns").on_hover_text("Each selected column prints one label (transposed)").changed()
-                    {
-                        act = Some(DAct::ByColumns(by_cols));
-                    }
-                    ui.separator();
-                    let mut hdr = src.header;
-                    let hdr_label = if src.by_columns { "First column = field names" } else { "First row = column names" };
-                    if ui.checkbox(&mut hdr, hdr_label).changed() {
-                        act = Some(DAct::Header(hdr));
-                    }
-                });
+                        if t.merged_count > 0 {
+                            let mut fm = src.fill_merged;
+                            if ui
+                                .checkbox(&mut fm, format!("Fill merged ({})", t.merged_count))
+                                .on_hover_text("Repeat merged-cell values on every row in the group so every label gets them")
+                                .changed()
+                            {
+                                act = Some(DAct::FillMerged(fm));
+                            }
+                        }
+                    });
+                }
+
                 if let Some(e) = &self.table_err {
                     ui.colored_label(Color32::from_rgb(220, 60, 50), e);
                 }
+
                 if let Some(t) = &self.table {
+                    let mut tbl_act = TableAction::None;
                     table_ui(
                         ui,
                         t,
@@ -829,7 +1104,17 @@ impl App {
                         &mut self.table_filter,
                         &mut self.preview_row,
                         &mut self.last_click,
+                        &mut self.table_drag,
+                        &self.picked_fields,
+                        &self.dev.cfg,
+                        &mut tbl_act,
                     );
+                    match tbl_act {
+                        TableAction::ToggleHeader(h) => act = Some(DAct::ToggleField(h)),
+                        TableAction::AddToLabel => act = Some(DAct::Insert(InsertMode::Append)),
+                        TableAction::UseHeaderRow(r) => act = Some(DAct::HeaderRow(r)),
+                        TableAction::None => {}
+                    }
                 }
             }
         });
@@ -838,10 +1123,11 @@ impl App {
             app.p.sel_rows.clear();
             app.preview_row = None;
             app.last_click = None;
+            app.table_drag = None;
         };
         match act {
             Some(DAct::Change) => {
-                self.pick_data_file();
+                self.pick_data_file(ctx, false);
             }
             Some(DAct::Reload) => {
                 self.reload_table();
@@ -852,30 +1138,36 @@ impl App {
             Some(DAct::Remove) => {
                 self.p.label.data = None;
                 self.data_collapsed = false;
+                self.picked_fields.clear();
                 reset(self);
                 self.reload_table();
             }
             Some(DAct::Sheet(s)) => {
                 if let Some(d) = &mut self.p.label.data {
                     d.sheet = s;
+                    d.header_row = None;
                 }
+                self.picked_fields.clear();
                 reset(self);
                 self.reload_table();
             }
-            Some(DAct::Header(h)) => {
+            Some(DAct::HeaderRow(r)) => {
                 if let Some(d) = &mut self.p.label.data {
-                    d.header = h;
+                    d.header = true;
+                    d.header_row = Some(r);
                 }
+                self.picked_fields.clear();
                 reset(self);
                 self.reload_table();
             }
-            Some(DAct::ByColumns(c)) => {
+            Some(DAct::FillMerged(fm)) => {
                 if let Some(d) = &mut self.p.label.data {
-                    d.by_columns = c;
+                    d.fill_merged = fm;
                 }
-                reset(self);
                 self.reload_table();
             }
+            Some(DAct::ToggleField(h)) => self.toggle_picked_field(&h),
+            Some(DAct::Insert(m)) => self.insert_picked_fields(m),
             None => {}
         }
     }
@@ -901,15 +1193,21 @@ impl App {
 
     // ---------------------------------------------------------------- files
 
-    fn save(&mut self, as_new: bool) {
-        let path = match (&self.p.doc_path, as_new) {
-            (Some(p), false) => Some(std::path::PathBuf::from(p)),
-            _ => rfd::FileDialog::new()
+    fn save(&mut self, ctx: &egui::Context, as_new: bool) {
+        if let (Some(p), false) = (&self.p.doc_path, as_new) {
+            self.save_to(std::path::PathBuf::from(p));
+            return;
+        }
+        self.spawn_dialog(ctx, || {
+            rfd::FileDialog::new()
                 .add_filter("Label", &["ptlabel", "json"])
                 .set_file_name("label.ptlabel")
-                .save_file(),
-        };
-        let Some(path) = path else { return };
+                .save_file()
+                .map(DialogRes::SaveLabel)
+        });
+    }
+
+    fn save_to(&mut self, path: std::path::PathBuf) {
         match serde_json::to_string_pretty(&self.p.label)
             .map_err(anyhow::Error::from)
             .and_then(|s| std::fs::write(&path, s).map_err(Into::into))
@@ -939,7 +1237,16 @@ impl App {
             .show();
         match r {
             rfd::MessageDialogResult::Custom(c) if c == save => {
-                self.save(false);
+                let path = match &self.p.doc_path {
+                    Some(p) => Some(std::path::PathBuf::from(p)),
+                    None => rfd::FileDialog::new()
+                        .add_filter("Label", &["ptlabel", "json"])
+                        .set_file_name("label.ptlabel")
+                        .save_file(),
+                };
+                if let Some(p) = path {
+                    self.save_to(p);
+                }
                 self.p.label == self.saved // cancelled or failed save keeps the label
             }
             rfd::MessageDialogResult::Custom(c) => c == "Don't Save",
@@ -947,11 +1254,13 @@ impl App {
         }
     }
 
-    fn open(&mut self) {
-        let Some(path) = rfd::FileDialog::new().add_filter("Label", &["ptlabel", "json"]).pick_file() else {
-            return;
-        };
-        self.open_path(path);
+    fn open(&mut self, ctx: &egui::Context) {
+        self.spawn_dialog(ctx, || {
+            rfd::FileDialog::new()
+                .add_filter("Label", &["ptlabel", "json"])
+                .pick_file()
+                .map(DialogRes::OpenLabel)
+        });
     }
 
     fn open_path(&mut self, path: std::path::PathBuf) {
@@ -981,12 +1290,19 @@ impl App {
     }
 
     /// The label as previewed (current values / first row) as a pixel-exact PNG, like `ptlabel render`.
-    fn export_png(&mut self) {
+    fn export_png(&mut self, ctx: &egui::Context) {
         let stem = self.p.doc_path.as_deref().and_then(|p| std::path::Path::new(p).file_stem());
         let name = format!("{}.png", stem.map_or("label".into(), |s| s.to_string_lossy()));
-        let Some(path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name(name).save_file() else {
-            return;
-        };
+        self.spawn_dialog(ctx, move || {
+            rfd::FileDialog::new()
+                .add_filter("PNG image", &["png"])
+                .set_file_name(name)
+                .save_file()
+                .map(DialogRes::ExportPng)
+        });
+    }
+
+    fn export_png_to(&mut self, path: std::path::PathBuf) {
         let (tape, vars, opts) = (self.tape(), self.preview_vars(), &self.p.settings.opts);
         let out = self.renderer.lock().unwrap_or_else(|e| e.into_inner()).render(&self.p.label, &tape, &vars, opts);
         match save_png(&out.bitmap, &tape, opts, &path) {
@@ -1104,6 +1420,25 @@ impl App {
             ui.spacing_mut().item_spacing.x = 7.0;
             icons::logo(ui, 22.0);
             ui.label(RichText::new("PTLabel").strong().size(16.0));
+            #[cfg(feature = "dev")]
+            {
+                let dev_fill = if self.dev.open {
+                    Color32::from_rgb(230, 165, 16)
+                } else {
+                    Color32::from_rgb(248, 204, 56)
+                };
+                let pill = egui::Button::new(RichText::new("DEV").strong().size(11.0).color(Color32::from_rgb(28, 37, 51)))
+                    .fill(dev_fill)
+                    .corner_radius(4.0)
+                    .min_size(egui::vec2(0.0, 20.0));
+                if ui
+                    .add(pill)
+                    .on_hover_text("Toggle Dev UI Inspector (⌘⇧D) · live-reloads dev-ui.json without recompiling")
+                    .clicked()
+                {
+                    self.dev.open = !self.dev.open;
+                }
+            }
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.separator();
 
@@ -1265,7 +1600,7 @@ impl App {
         let mut btn = egui::Button::new((egui::Atom::custom(icon_id, egui::Vec2::splat(28.0)), text_rt))
             .min_size(egui::vec2(ui.available_width(), 58.0));
         if enabled {
-            btn = btn.fill(ACCENT);
+            btn = btn.fill(self.dev.cfg.accent());
         }
         ui.add_space(6.0);
         let out = ui.add_enabled_ui(enabled, |ui| btn.atom_ui(ui)).inner;
@@ -1422,7 +1757,7 @@ impl App {
         }
         let [w, h] = pv.phys;
         let avail = ui.available_width() - 24.0;
-        let scale = (avail / w).min(230.0 / h).clamp(0.35, 3.0);
+        let scale = (avail / w).min(self.dev.cfg.preview_max_height / h).clamp(0.35, 3.0);
         let size = Vec2::new(w, h) * scale;
         egui::Frame::new()
             .fill(ui.visuals().extreme_bg_color)
@@ -1440,38 +1775,101 @@ impl App {
 
     fn label_options(&mut self, ui: &mut egui::Ui) {
         let l = &mut self.p.label;
+        let mut popup_open = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label("Length");
-            ui.selectable_value(&mut l.fixed_length, false, "Auto");
-            ui.selectable_value(&mut l.fixed_length, true, "Fixed");
+            ui.spacing_mut().interact_size.y = 28.0;
+            section_label(ui, "LENGTH", 28.0);
+            ui.separator();
+            egui::Frame::new()
+                .fill(ui.visuals().faint_bg_color)
+                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::same(2))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.spacing_mut().interact_size.y = 24.0;
+                        ui.selectable_value(&mut l.fixed_length, false, "Auto");
+                        ui.selectable_value(&mut l.fixed_length, true, "Fixed");
+                    });
+                });
             if l.fixed_length {
-                ui.add(DragValue::new(&mut l.length_mm).range(5.0..=1000.0).speed(0.2).fixed_decimals(1).suffix(" mm"));
+                let was_open = self.length_popup_was_open;
+                let input = &mut self.length_input;
+                ComboBox::from_id_salt("fixed_length")
+                    .width(96.0)
+                    .selected_text(format!("{:.1} mm", l.length_mm))
+                    .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+                    .show_ui(ui, |ui| {
+                        popup_open = true;
+                        if !was_open {
+                            *input = format!("{:.1}", l.length_mm);
+                        }
+                        ui.horizontal(|ui| {
+                            let id = ui.make_persistent_id("fixed_len_edit");
+                            let out = TextEdit::singleline(input)
+                                .id(id)
+                                .desired_width(72.0)
+                                .hint_text("5–1000")
+                                .show(ui);
+                            let resp = out.response;
+                            if !was_open {
+                                resp.request_focus();
+                                let mut state = out.state;
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(input.chars().count()),
+                                )));
+                                state.store(ui.ctx(), id);
+                            }
+                            ui.label("mm");
+                            if resp.changed()
+                                && let Ok(v) = input.trim().replace(',', ".").parse::<f32>()
+                                && (5.0..=1000.0).contains(&v)
+                            {
+                                l.length_mm = v;
+                            }
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                if let Ok(v) = input.trim().replace(',', ".").parse::<f32>() {
+                                    l.length_mm = v.clamp(5.0, 1000.0);
+                                }
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        ui.label(RichText::new("Presets").small().weak());
+                        for (name, mm) in LENGTH_PRESETS {
+                            let active = (l.length_mm - mm).abs() < 0.05;
+                            if ui.selectable_label(active, format!("{name} · {mm:.0} mm")).clicked() {
+                                l.length_mm = mm;
+                                *input = format!("{mm:.1}");
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Click to enter a custom length or pick a preset");
                 align_buttons(ui, &mut l.align);
             }
-            ui.menu_button("Presets", |ui| {
-                for (name, mm) in LENGTH_PRESETS {
-                    if ui.button(format!("{name} · {mm:.0} mm")).clicked() {
-                        l.fixed_length = true;
-                        l.length_mm = mm;
-                        ui.close();
-                    }
-                }
-            });
             ui.separator();
-            ui.label("Gap");
+            ui.label(RichText::new("Gap").weak());
             ui.add(DragValue::new(&mut l.gap_mm).range(0.0..=50.0).speed(0.1).fixed_decimals(1).suffix(" mm"));
             ui.separator();
             ui.checkbox(&mut l.frame, "Frame");
             ui.checkbox(&mut l.invert, "Invert");
         });
+        self.length_popup_was_open = popup_open;
     }
 
-    fn add_block_bar(&mut self, ui: &mut egui::Ui) {
+    fn add_block_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let mut add_excel = false;
         let blocks = &mut self.p.label.blocks;
         let collapsed = &mut self.collapsed;
         ui.horizontal_wrapped(|ui| {
-            ui.weak("Add");
+            // Match the 32 px button height so the section label centres vertically with the buttons.
+            ui.spacing_mut().interact_size.y = 32.0;
+            section_label(ui, "ADD", 32.0);
+            ui.separator();
             if icons::button(ui, Icon::Text, "Text").clicked() {
                 blocks.push(Block::Text(TextBlock { text: "Text".into(), ..Default::default() }));
                 collapsed.push(false);
@@ -1484,7 +1882,7 @@ impl App {
                 collapsed.push(false);
             }
             if icons::button(ui, Icon::Sheet, "Excel")
-                .on_hover_text("Print from spreadsheet rows or columns (xlsx, xls, ods, csv)")
+                .on_hover_text("Print from spreadsheet rows or columns (xlsx, xls, ods, csv) — or drag a file onto the window")
                 .clicked()
             {
                 add_excel = true;
@@ -1511,11 +1909,11 @@ impl App {
             }
         });
         if add_excel {
-            self.add_excel();
+            self.add_excel(ctx);
         }
     }
 
-    fn blocks_ui(&mut self, ui: &mut egui::Ui) {
+    fn blocks_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         enum Act {
             Up,
             Down,
@@ -1581,7 +1979,11 @@ impl App {
                 });
                 if !*minimized {
                     match b {
-                        Block::Text(t) => text_editor(ui, i, t, fonts, filter, speller, target, &headers),
+                        Block::Text(t) => {
+                            if text_editor(ui, i, t, fonts, filter, speller, target, &headers) {
+                                self.active_text_block = Some(i);
+                            }
+                        }
                         Block::Sequence(q) => {
                             let (_, ph, in_text) = seq_info.as_ref().unwrap();
                             sequence_editor(ui, i, q, fonts, filter, rows_drive, by_columns, *in_text, ph);
@@ -1605,11 +2007,12 @@ impl App {
             });
         }
         if let Some(i) = picked_image {
-            if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg"]).pick_file() {
-                if let Block::Image(im) = &mut self.p.label.blocks[i] {
-                    im.path = path.display().to_string();
-                }
-            }
+            self.spawn_dialog(ctx, move || {
+                rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg"])
+                    .pick_file()
+                    .map(|path| DialogRes::PickImage { block: i, path })
+            });
         }
         if act.is_some() {
             self.spell_target = None; // its block index is stale once blocks move
@@ -1636,47 +2039,79 @@ impl App {
             }
             None => {}
         }
-
-        ui.add_space(4.0);
-        let seq_hints = (0..seq_count.max(1)).map(sequence_placeholder).collect::<Vec<_>>().join("  ");
-        let mut hint = format!("Placeholders: {{n}}  {{n:03}}  {seq_hints}  {{date}}  {{time}}");
-        if !headers.is_empty() {
-            let cols: Vec<String> = headers.iter().take(8).map(|h| format!("{{{h}}}")).collect();
-            let label = if by_columns { "Fields" } else { "Columns" };
-            hint += &format!("   ·   {label}: {}", cols.join("  "));
-        }
-        ui.weak(hint);
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if let Some((m, err, t)) = &self.msg {
-                if t.elapsed().as_secs() < 12 || *err {
-                    let c = if *err { Color32::from_rgb(220, 60, 50) } else { ui.visuals().text_color() };
-                    ui.colored_label(c, m);
-                    if !*err {
-                        // Hide it on time even if nothing else repaints (idle status polls don't).
-                        ui.ctx().request_repaint_after(Duration::from_secs(12).saturating_sub(t.elapsed()));
-                    }
+    fn status_left(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.spacing_mut().item_spacing.y = 1.0;
+        if let Some((m, err, t)) = &self.msg
+            && (t.elapsed().as_secs() < 12 || *err)
+        {
+            let c = if *err { Color32::from_rgb(220, 60, 50) } else { ui.visuals().text_color() };
+            ui.colored_label(c, RichText::new(m).size(12.0));
+            if !*err {
+                // Hide it on time even if nothing else repaints (idle status polls don't).
+                ui.ctx().request_repaint_after(Duration::from_secs(12).saturating_sub(t.elapsed()));
+            }
+        }
+        let seq_count = self.p.label.sequences().count();
+        let seq_hints = (0..seq_count.max(1)).map(sequence_placeholder).collect::<Vec<_>>().join("  ");
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+            ui.label(RichText::new("Sequence:").size(11.5).weak());
+            ui.label(RichText::new(format!("{{n}}  {{n:03}}  {seq_hints}")).size(11.5).monospace().weak());
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+            ui.label(RichText::new("Time:").size(11.5).weak());
+            ui.label(RichText::new("{date}  {time}").size(11.5).monospace().weak());
+        });
+        if self.p.label.data.is_some()
+            && let Some(t) = &self.table
+            && !t.headers.is_empty()
+        {
+            let cols: Vec<String> = t.headers.iter().take(8).map(|h| format!("{{{h}}}")).collect();
+            let mut text = cols.join("  ");
+            if t.headers.len() > 8 {
+                text += &format!("  +{} more", t.headers.len() - 8);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                ui.label(RichText::new("Columns:").size(11.5).weak());
+                ui.label(RichText::new(text).size(11.5).monospace().weak());
+            });
+        }
+    }
+
+    fn status_right(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "macos")]
+        const SHORTCUTS: &str = "⌘P print  ⌘S save  ⌘O open  ⌘N new";
+        #[cfg(not(target_os = "macos"))]
+        const SHORTCUTS: &str = "Ctrl+P print  Ctrl+S save  Ctrl+O open  Ctrl+N new";
+
+        ui.spacing_mut().interact_size.y = 0.0;
+        let avail_w = (ui.available_width() - 2.0).max(40.0);
+        let ref_sz = 10.0;
+        let ref_w = ui
+            .painter()
+            .layout_no_wrap(SHORTCUTS.to_string(), FontId::proportional(ref_sz), Color32::WHITE)
+            .size()
+            .x;
+        let sz = if ref_w > 0.0 { (ref_sz * (avail_w * 0.88) / ref_w).clamp(11.0, 14.0) } else { 13.0 };
+
+        ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            if let Some(r) = &self.update {
+                let t = if self.updating { "Updating…".to_string() } else { format!("Update to {}…", r.version) };
+                let resp = ui
+                    .add(egui::Label::new(RichText::new(format!("● {t}")).size(13.0).color(self.dev.cfg.accent())).sense(egui::Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Installs it and opens PTLabel again");
+                if resp.clicked() {
+                    self.update_modal = true;
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                #[cfg(target_os = "macos")]
-                ui.weak("⌘P print   ⌘S save   ⌘O open   ⌘N new");
-                #[cfg(not(target_os = "macos"))]
-                ui.weak("Ctrl+P print   Ctrl+S save   Ctrl+O open   Ctrl+N new");
-                if let Some(r) = &self.update {
-                    ui.separator();
-                    let t = if self.updating { "Updating…".to_string() } else { format!("Update to {}…", r.version) };
-                    let resp = ui
-                        .add(egui::Label::new(RichText::new(format!("● {t}")).color(ACCENT)).sense(egui::Sense::click()))
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("Installs it and opens PTLabel again");
-                    if resp.clicked() {
-                        self.update_modal = true;
-                    }
-                }
-            });
+            ui.add(egui::Label::new(RichText::new(SHORTCUTS).size(sz).weak()).extend());
         });
     }
 
@@ -1685,6 +2120,10 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let sc = |m, k| KeyboardShortcut::new(m, k);
         let shift_cmd = Modifiers::COMMAND | Modifiers::SHIFT;
+        #[cfg(feature = "dev")]
+        if ctx.input_mut(|i| i.consume_shortcut(&sc(shift_cmd, Key::D))) {
+            self.dev.open = !self.dev.open;
+        }
         let keys = [
             (sc(shift_cmd, Key::S), MenuCmd::SaveAs),
             (sc(shift_cmd, Key::E), MenuCmd::ExportPng),
@@ -1760,10 +2199,10 @@ impl App {
                 self.reload_table();
                 self.history = History::new(self.p.label.clone());
             }
-            MenuCmd::Open => self.open(),
-            MenuCmd::Save => self.save(false),
-            MenuCmd::SaveAs => self.save(true),
-            MenuCmd::ExportPng => self.export_png(),
+            MenuCmd::Open => self.open(ctx),
+            MenuCmd::Save => self.save(ctx, false),
+            MenuCmd::SaveAs => self.save(ctx, true),
+            MenuCmd::ExportPng => self.export_png(ctx),
             MenuCmd::Print => self.print(),
         }
     }
@@ -1841,6 +2280,127 @@ impl App {
     }
 }
 
+/// Render GitHub release notes (headings, bullets, inline **bold** and `code`) inside the update dialog.
+fn changelog_ui(ui: &mut egui::Ui, notes: &[crate::update::ReleaseNote], accent: Color32, body_sz: f32) {
+    let ver_sz = body_sz + 2.0;
+    let head_sz = body_sz + 1.0;
+    for (idx, note) in notes.iter().enumerate() {
+        if idx > 0 {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(10.0);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("v{}", note.version)).size(ver_sz).strong().monospace().color(accent));
+            if !note.date.is_empty() {
+                ui.label(RichText::new(format!("·  {}", note.date)).size(body_sz - 1.0).weak());
+            }
+            let title = note.title.trim();
+            if !title.is_empty() && !title.eq_ignore_ascii_case(&format!("v{}", note.version)) && !title.eq_ignore_ascii_case(&note.version) {
+                ui.label(RichText::new(format!("—  {title}")).size(body_sz).strong());
+            }
+        });
+        ui.add_space(6.0);
+        if note.body.trim().is_empty() {
+            ui.label(RichText::new("Bug fixes and improvements.").size(body_sz).weak());
+            continue;
+        }
+        for raw_line in note.body.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                ui.add_space(6.0);
+                continue;
+            }
+            if let Some(heading) = line.strip_prefix("### ").or_else(|| line.strip_prefix("## ")).or_else(|| line.strip_prefix("# ")) {
+                ui.add_space(4.0);
+                ui.label(RichText::new(heading.trim()).size(head_sz).strong());
+                ui.add_space(2.0);
+            } else if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                ui.horizontal_top(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("•").size(body_sz).weak());
+                    ui.add(egui::Label::new(rich_markdown_line(ui, item.trim(), body_sz)).wrap());
+                });
+                ui.add_space(3.0);
+            } else {
+                ui.add(egui::Label::new(rich_markdown_line(ui, line, body_sz)).wrap());
+                ui.add_space(3.0);
+            }
+        }
+    }
+}
+
+/// Format inline `**bold**` and `` `code` `` spans in a single changelog line.
+fn rich_markdown_line(ui: &egui::Ui, line: &str, body_sz: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let v = ui.visuals();
+    let lh = Some((body_sz * 1.42).round());
+    let normal = egui::TextFormat {
+        font_id: FontId::proportional(body_sz),
+        color: v.text_color(),
+        line_height: lh,
+        ..Default::default()
+    };
+    let bold = egui::TextFormat {
+        font_id: FontId::new(body_sz, egui::FontFamily::Name("bold".into())),
+        color: v.strong_text_color(),
+        line_height: lh,
+        ..Default::default()
+    };
+    let code = egui::TextFormat {
+        font_id: FontId::monospace((body_sz - 1.0).max(11.0)),
+        color: v.strong_text_color(),
+        background: v.widgets.inactive.weak_bg_fill,
+        line_height: lh,
+        ..Default::default()
+    };
+    let mut rest = line;
+    while !rest.is_empty() {
+        let b_pos = rest.find("**");
+        let c_pos = rest.find('`');
+        let next = match (b_pos, c_pos) {
+            (Some(bi), Some(ci)) if bi <= ci => Some((bi, true)),
+            (Some(_), Some(ci)) => Some((ci, false)),
+            (Some(bi), None) => Some((bi, true)),
+            (None, Some(ci)) => Some((ci, false)),
+            (None, None) => None,
+        };
+        match next {
+            Some((bi, true)) => {
+                if bi > 0 {
+                    job.append(&rest[..bi], 0.0, normal.clone());
+                }
+                let after = &rest[bi + 2..];
+                if let Some(end) = after.find("**") {
+                    job.append(&after[..end], 0.0, bold.clone());
+                    rest = &after[end + 2..];
+                } else {
+                    job.append(&rest[bi..], 0.0, normal.clone());
+                    break;
+                }
+            }
+            Some((ci, false)) => {
+                if ci > 0 {
+                    job.append(&rest[..ci], 0.0, normal.clone());
+                }
+                let after = &rest[ci + 1..];
+                if let Some(end) = after.find('`') {
+                    job.append(&format!(" {} ", &after[..end]), 0.0, code.clone());
+                    rest = &after[end + 1..];
+                } else {
+                    job.append(&rest[ci..], 0.0, normal.clone());
+                    break;
+                }
+            }
+            None => {
+                job.append(rest, 0.0, normal.clone());
+                break;
+            }
+        }
+    }
+    job
+}
+
 /// Fixed lengths for lab containers, margins included. Tubes are labelled along their straight
 /// wall: laminated tape lifts when wrapped around a 10.8 mm tube.
 const LENGTH_PRESETS: [(&str, f32); 5] = [
@@ -1851,10 +2411,31 @@ const LENGTH_PRESETS: [(&str, f32); 5] = [
     ("50 ml Falcon, along the side", 60.0),
 ];
 
+/// Fixed-width muted uppercase section label so toolbar row titles read clearly as headers, not buttons.
+fn section_label(ui: &mut egui::Ui, title: &str, row_h: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, row_h), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.min.x + 2.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        FontId::new(10.5, egui::FontFamily::Name("bold".into())),
+        ui.visuals().weak_text_color(),
+    );
+}
+
 fn align_buttons(ui: &mut egui::Ui, a: &mut Align) {
-    ui.selectable_value(a, Align::Left, "Left");
-    ui.selectable_value(a, Align::Center, "Center");
-    ui.selectable_value(a, Align::Right, "Right");
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        if icons::toggle_icon(ui, *a == Align::Left, Icon::AlignLeft, "Align left").clicked() {
+            *a = Align::Left;
+        }
+        if icons::toggle_icon(ui, *a == Align::Center, Icon::AlignCenter, "Align center").clicked() {
+            *a = Align::Center;
+        }
+        if icons::toggle_icon(ui, *a == Align::Right, Icon::AlignRight, "Align right").clicked() {
+            *a = Align::Right;
+        }
+    });
 }
 
 /// Red zigzag under a misspelled word, like Word/Pages.
@@ -1952,37 +2533,45 @@ fn text_editor(
     speller: &mut Speller,
     target: &mut Option<(usize, Miss, Vec<String>)>,
     headers: &[String],
-) {
+) -> bool {
     let out = TextEdit::multiline(&mut t.text)
         .desired_rows(2)
         .desired_width(f32::INFINITY)
         .font(FontId::proportional(18.0))
         .hint_text("Text (Enter = new line)")
         .show(ui);
+    let focused = out.response.response.has_focus();
     spell_ui(ui, &out, &mut t.text, i, speller, target);
     style_row(ui, i, t, fonts, filter, headers);
+    focused
 }
 
-/// "+ Field" menu: appends a `{Column}` placeholder from the spreadsheet.
+/// "+ Field" menu: appends `{Column}` placeholders from the spreadsheet (stays open so multiple
+/// fields can be added in a row; click outside to close).
 fn field_menu(ui: &mut egui::Ui, target: &mut String, headers: &[String], space: bool) {
     if headers.is_empty() {
         return;
     }
-    ui.menu_button("+ Field", |ui| {
-        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-            for h in headers {
-                if ui.button(h).clicked() {
-                    if space && !target.is_empty() && !target.ends_with([' ', '\n']) {
-                        target.push(' ');
+    egui::containers::menu::MenuButton::new("+ Field")
+        .config(egui::containers::menu::MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside))
+        .ui(ui, |ui| {
+            ui.label(RichText::new("Click fields to insert").small().weak());
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for h in headers {
+                    let ph = format!("{{{h}}}");
+                    let used = target.contains(&ph);
+                    let lbl = if used { format!("✓ {h}") } else { h.clone() };
+                    if ui.selectable_label(used, lbl).clicked() {
+                        if space && !target.is_empty() && !target.ends_with([' ', '\n']) {
+                            target.push(' ');
+                        }
+                        target.push_str(&ph);
                     }
-                    target.push_str(&format!("{{{h}}}"));
-                    ui.close();
                 }
-            }
-        });
-    })
-    .response
-    .on_hover_text("Insert a spreadsheet field");
+            });
+        })
+        .0
+        .on_hover_text("Insert one or more spreadsheet fields");
 }
 
 /// Font, size, B/I/U, alignment (shared by text and sequence blocks).
@@ -2081,6 +2670,21 @@ fn sequence_editor(
 }
 
 /// Spreadsheet rows or columns: click toggles, ⇧-click selects a range; virtualised for big sheets.
+/// Collapse multi-line cell text onto a single readable line for table display.
+fn cell_one_line(s: &str) -> String {
+    let mut out = String::new();
+    for part in s.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// Spreadsheet rows or columns: click or drag-paint to select, ⇧-click for ranges, click column
+/// headers to toggle fields, right-click a cell to select all matching rows or set header row.
+#[allow(clippy::too_many_arguments)]
 fn table_ui(
     ui: &mut egui::Ui,
     t: &Table,
@@ -2089,6 +2693,10 @@ fn table_ui(
     filter: &mut String,
     preview_row: &mut Option<usize>,
     last: &mut Option<usize>,
+    drag: &mut Option<bool>,
+    picked_fields: &[String],
+    cfg: &UiConfig,
+    act: &mut TableAction,
 ) {
     use egui::{Align2, Rect, Sense, pos2, vec2};
     let (unit, units) = if by_columns { ("column", "columns") } else { ("row", "rows") };
@@ -2096,36 +2704,119 @@ fn table_ui(
     let visible: Vec<usize> = (0..t.rows.len())
         .filter(|&i| f.is_empty() || t.rows[i].iter().any(|c| c.to_lowercase().contains(&f)))
         .collect();
+
+    // Stop drag-painting as soon as the primary mouse button is released.
+    if !ui.input(|i| i.pointer.primary_down()) {
+        *drag = None;
+    }
+
+    // Determine the sequence of rows for the preview stepper (selected rows, else visible rows).
+    let mut nav_rows: Vec<usize> = if sel.is_empty() { visible.clone() } else { sel.clone() };
+    nav_rows.sort_unstable();
+    nav_rows.dedup();
+    let cur_nav_pos = preview_row
+        .and_then(|r| nav_rows.iter().position(|&x| x == r))
+        .unwrap_or(0);
+    let active_preview_row = nav_rows.get(cur_nav_pos).copied();
+
     ui.horizontal_wrapped(|ui| {
-        ui.add(TextEdit::singleline(filter).hint_text(format!("Search {units}…")).desired_width(200.0));
-        if ui.button("Select all").on_hover_text(format!("All {units} shown")).clicked() {
+        ui.add(TextEdit::singleline(filter).hint_text(format!("Filter {units}…")).desired_width(180.0));
+        if !filter.is_empty() && ui.small_button("×").on_hover_text("Clear filter").clicked() {
+            filter.clear();
+        }
+        if ui.button("All").on_hover_text(format!("Select all shown {units}")).clicked() {
             let have: std::collections::HashSet<usize> = sel.iter().copied().collect();
             sel.extend(visible.iter().filter(|i| !have.contains(i)));
         }
-        if ui.button("Clear").clicked() {
+        if ui.button("Invert").on_hover_text(format!("Invert selection among shown {units}")).clicked() {
+            let mut have: std::collections::HashSet<usize> = sel.iter().copied().collect();
+            for &ri in &visible {
+                if !have.remove(&ri) {
+                    have.insert(ri);
+                }
+            }
+            *sel = have.into_iter().collect();
+        }
+        if ui.add_enabled(!sel.is_empty(), egui::Button::new("None")).on_hover_text("Clear selection").clicked() {
             sel.clear();
         }
-        #[cfg(target_os = "macos")]
-        ui.weak(format!("{} of {} {units} selected  ·  click a {unit}, ⇧-click for a range", sel.len(), t.rows.len()));
-        #[cfg(not(target_os = "macos"))]
-        ui.weak(format!("{} of {} {units} selected  ·  click a {unit}, Shift-click for a range", sel.len(), t.rows.len()));
+        let has_fields = !picked_fields.is_empty();
+        let add_btn = if has_fields {
+            egui::Button::new(RichText::new("Add to label").strong().color(Color32::WHITE)).fill(cfg.accent())
+        } else {
+            egui::Button::new("Add to label")
+        };
+        let add_tip = if has_fields {
+            let tpl: String = picked_fields.iter().map(|h| format!("{{{h}}}")).collect::<Vec<_>>().join(" ");
+            format!("Insert {tpl} into the label")
+        } else {
+            "Click column headers below to select columns, then click Add to label".to_string()
+        };
+        if ui
+            .add_enabled(has_fields, add_btn)
+            .on_hover_text(&add_tip)
+            .on_disabled_hover_text(&add_tip)
+            .clicked()
+        {
+            *act = TableAction::AddToLabel;
+        }
+        let sel_label = format!("{} / {} {units}", sel.len(), t.rows.len());
+        if sel.is_empty() {
+            ui.colored_label(Color32::from_rgb(220, 155, 25), sel_label);
+        } else {
+            ui.label(RichText::new(sel_label).strong());
+        }
+
+        if cfg.show_preview_stepper && !nav_rows.is_empty() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_step = nav_rows.len() > 1;
+                if ui.add_enabled(can_step, egui::Button::new("›").min_size(vec2(24.0, 22.0)))
+                    .on_hover_text("Preview next label")
+                    .clicked()
+                {
+                    let next = (cur_nav_pos + 1) % nav_rows.len();
+                    *preview_row = Some(nav_rows[next]);
+                }
+                if let Some(ri) = active_preview_row {
+                    let row_lbl = t.row_labels.get(ri).map(String::as_str).unwrap_or("?");
+                    let tag = if by_columns { format!("Col {row_lbl}") } else { format!("Row {row_lbl}") };
+                    ui.weak(format!("{tag} ({}/{})", cur_nav_pos + 1, nav_rows.len()));
+                }
+                if ui.add_enabled(can_step, egui::Button::new("‹").min_size(vec2(24.0, 22.0)))
+                    .on_hover_text("Preview previous label")
+                    .clicked()
+                {
+                    let prev = if cur_nav_pos == 0 { nav_rows.len() - 1 } else { cur_nav_pos - 1 };
+                    *preview_row = Some(nav_rows[prev]);
+                }
+                ui.weak("Preview");
+            });
+        }
     });
 
-    let font = FontId::proportional(14.0);
-    // Width of each column's longest entry (header + first 200 rows), measured.
+    let font = FontId::proportional(cfg.table_font_size);
+    let hdr_font = FontId::proportional((cfg.table_font_size - 0.5).max(10.0));
+    // Measure each column from header + first 200 rows (using full single-line representation).
     let widths: Vec<f32> = (0..t.headers.len())
         .map(|c| {
-            let longest = std::iter::once(t.headers[c].as_str())
-                .chain(t.rows.iter().take(200).map(|r| r[c].lines().next().unwrap_or("")))
-                .max_by_key(|s| s.chars().count())
-                .unwrap_or("");
-            let w = ui.painter().layout_no_wrap(longest.to_string(), font.clone(), Color32::WHITE).size().x;
-            (w + 22.0).clamp(40.0, 280.0)
+            let mut max_w = ui
+                .painter()
+                .layout_no_wrap(format!("9 · {}", t.headers[c]), hdr_font.clone(), Color32::WHITE)
+                .size()
+                .x;
+            for r in t.rows.iter().take(200) {
+                let s = cell_one_line(&r[c]);
+                let w = ui.painter().layout_no_wrap(s, font.clone(), Color32::WHITE).size().x;
+                if w > max_w {
+                    max_w = w;
+                }
+            }
+            (max_w + cfg.table_cell_pad * 2.0 + 6.0).clamp(cfg.table_min_col_width, cfg.table_max_col_width)
         })
         .collect();
-    let (chk_w, num_w, row_h) = (28.0, 42.0, 24.0);
+    let (chk_w, num_w, row_h, hdr_h) = (30.0, 42.0, cfg.table_row_height, cfg.table_header_height);
     let total_w = (chk_w + num_w + widths.iter().sum::<f32>()).max(ui.available_width());
-    let (sel_bg, sel_fg, hov_bg, stripe, fg, weak, strong) = {
+    let (sel_bg, sel_fg, hov_bg, stripe, fg, weak, strong, grid_col) = {
         let v = ui.visuals();
         (
             v.selection.bg_fill,
@@ -2135,49 +2826,147 @@ fn table_ui(
             v.text_color(),
             v.weak_text_color(),
             v.strong_text_color(),
+            v.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.45),
         )
     };
-    let accent = Color32::from_rgb(58, 123, 234);
-    let cells = |p: &egui::Painter, rect: Rect, values: &[String], col: Color32| {
-        let mut x = rect.min.x + chk_w + num_w;
-        for (c, v) in values.iter().enumerate() {
-            let cell = Rect::from_min_size(pos2(x, rect.min.y), vec2(widths[c], row_h));
-            let text = v.lines().next().unwrap_or("");
-            p.with_clip_rect(cell.shrink2(vec2(6.0, 0.0)))
-                .text(pos2(x + 8.0, rect.center().y), Align2::LEFT_CENTER, text, font.clone(), col);
-            x += widths[c];
-        }
-    };
+    let accent = cfg.accent();
+    let accent_tint = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 26);
+    let merged_bar_col = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 110);
+
+    // Precompute visible selection summary for the header tri-state checkbox.
+    let sel_set: std::collections::HashSet<usize> = sel.iter().copied().collect();
+    let vis_selected = visible.iter().filter(|ri| sel_set.contains(ri)).count();
+    let all_vis = !visible.is_empty() && vis_selected == visible.len();
+    let some_vis = vis_selected > 0 && vis_selected < visible.len();
+
+    let mut group_op: Option<(usize, String, GroupOp)> = None;
 
     egui::ScrollArea::horizontal().id_salt("data_h").show(ui, |ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(total_w, row_h), Sense::hover());
-        ui.painter().rect_filled(rect, 3.0, stripe);
-        ui.painter().text(
-            pos2(rect.min.x + chk_w + num_w - 8.0, rect.center().y),
+        // Header row: tri-state select-all checkbox + clickable column headers.
+        let (hrect, hresp) = ui.allocate_exact_size(vec2(total_w, hdr_h), Sense::click());
+        let hp = ui.painter();
+        hp.rect_filled(hrect, 3.0, stripe);
+
+        // Tri-state checkbox in header
+        let cb = Rect::from_center_size(pos2(hrect.min.x + chk_w / 2.0, hrect.center().y), Vec2::splat(14.0));
+        if all_vis {
+            hp.rect_filled(cb, 3.0, accent);
+            let c = cb.center();
+            hp.add(egui::Shape::line(
+                vec![c + vec2(-3.5, 0.2), c + vec2(-1.0, 3.0), c + vec2(4.0, -3.0)],
+                egui::Stroke::new(1.8, Color32::WHITE),
+            ));
+        } else if some_vis {
+            hp.rect_filled(cb, 3.0, accent);
+            let c = cb.center();
+            hp.line_segment([c + vec2(-3.5, 0.0), c + vec2(3.5, 0.0)], egui::Stroke::new(2.0, Color32::WHITE));
+        } else {
+            hp.rect_stroke(cb, 3.0, (1.2, weak), egui::StrokeKind::Inside);
+        }
+
+        hp.text(
+            pos2(hrect.min.x + chk_w + num_w - 8.0, hrect.center().y),
             Align2::RIGHT_CENTER,
             if by_columns { "Col" } else { "#" },
             FontId::proportional(12.0),
             weak,
         );
-        cells(ui.painter(), rect, &t.headers, strong);
+
+        let ptr = ui.input(|i| i.pointer.hover_pos());
+        let mut x = hrect.min.x + chk_w + num_w;
+        for (c, h) in t.headers.iter().enumerate() {
+            let cell = Rect::from_min_size(pos2(x, hrect.min.y), vec2(widths[c], hdr_h));
+            let picked_pos = picked_fields.iter().position(|p| p == h);
+            let hovered_col = hresp.hovered() && ptr.is_some_and(|p| cell.contains(p));
+            if picked_pos.is_some() {
+                hp.rect_filled(cell, 2.0, accent_tint);
+                hp.line_segment(
+                    [pos2(cell.min.x + 2.0, cell.max.y - 1.5), pos2(cell.max.x - 2.0, cell.max.y - 1.5)],
+                    egui::Stroke::new(2.5, accent),
+                );
+            } else if hovered_col {
+                hp.rect_filled(cell, 2.0, hov_bg);
+            }
+            if cfg.table_grid_lines {
+                hp.line_segment([pos2(x, hrect.min.y + 3.0), pos2(x, hrect.max.y - 3.0)], (1.0, grid_col));
+            }
+            let title = match picked_pos {
+                Some(k) => format!("{} · {h}", k + 1),
+                None => h.clone(),
+            };
+            let col = if picked_pos.is_some() { accent } else { strong };
+            hp.with_clip_rect(cell.shrink2(vec2(4.0, 0.0))).text(
+                pos2(x + cfg.table_cell_pad, hrect.center().y),
+                Align2::LEFT_CENTER,
+                title,
+                hdr_font.clone(),
+                col,
+            );
+            x += widths[c];
+        }
+        hp.line_segment([pos2(hrect.min.x, hrect.max.y), pos2(hrect.max.x, hrect.max.y)], (1.0, grid_col));
+
+        if hresp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if hresp.clicked() && let Some(pos) = hresp.interact_pointer_pos() {
+            if pos.x < hrect.min.x + chk_w + num_w {
+                // Toggle all visible rows
+                if all_vis {
+                    let vis_set: std::collections::HashSet<usize> = visible.iter().copied().collect();
+                    sel.retain(|r| !vis_set.contains(r));
+                } else {
+                    let have: std::collections::HashSet<usize> = sel.iter().copied().collect();
+                    sel.extend(visible.iter().filter(|i| !have.contains(i)));
+                }
+            } else {
+                // Toggle the clicked column in the multi-field builder
+                let mut cx = hrect.min.x + chk_w + num_w;
+                for (c, h) in t.headers.iter().enumerate() {
+                    if pos.x >= cx && pos.x < cx + widths[c] {
+                        *act = TableAction::ToggleHeader(h.clone());
+                        break;
+                    }
+                    cx += widths[c];
+                }
+            }
+        }
+        hresp.on_hover_text("Click checkbox to select all shown · Click any column header to add/remove it as {Column}");
+
+        // Virtualised table body with drag-paint selection & right-click group selection.
+        let mut hover_tip: Option<String> = None;
         egui::ScrollArea::vertical()
             .id_salt("data_v")
-            .max_height(260.0)
+            .max_height(cfg.table_max_height)
             .auto_shrink([false, true])
             .show_rows(ui, row_h, visible.len(), |ui, range| {
+                let primary_down = ui.input(|i| i.pointer.primary_down());
+                let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+                let shift = ui.input(|i| i.modifiers.shift);
+                let pointer_pos = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
+
                 for vi in range {
                     let ri = visible[vi];
                     let (rect, resp) = ui.allocate_exact_size(vec2(total_w, row_h), Sense::click());
                     let on = sel.contains(&ri);
+                    let is_pv = active_preview_row == Some(ri);
                     let p = ui.painter();
                     if on {
-                        p.rect_filled(rect, 3.0, sel_bg);
+                        p.rect_filled(rect, 2.0, sel_bg);
                     } else if resp.hovered() {
-                        p.rect_filled(rect, 3.0, hov_bg);
-                    } else if vi % 2 == 1 {
+                        p.rect_filled(rect, 2.0, hov_bg);
+                    } else if cfg.table_zebra && vi % 2 == 1 {
                         p.rect_filled(rect, 0.0, stripe);
                     }
-                    let b = Rect::from_center_size(pos2(rect.min.x + chk_w / 2.0, rect.center().y), egui::Vec2::splat(14.0));
+                    // Subtle left bar marks the row currently shown in the live label preview.
+                    if is_pv {
+                        p.rect_filled(
+                            Rect::from_min_size(rect.min, vec2(3.0, row_h)),
+                            1.0,
+                            accent,
+                        );
+                    }
+                    let b = Rect::from_center_size(pos2(rect.min.x + chk_w / 2.0 + 1.0, rect.center().y), Vec2::splat(14.0));
                     if on {
                         p.rect_filled(b, 3.0, accent);
                         let c = b.center();
@@ -2193,16 +2982,187 @@ fn table_ui(
                         Align2::RIGHT_CENTER,
                         &t.row_labels[ri],
                         FontId::proportional(12.0),
-                        weak,
+                        if is_pv { accent } else { weak },
                     );
-                    cells(p, rect, &t.rows[ri], if on { sel_fg } else { fg });
-                    if resp.clicked() {
-                        click_row(sel, &visible, last, vi, ui.input(|i| i.modifiers.shift));
-                        *preview_row = Some(ri);
+
+                    // Paint cells with single-line folding, grid dividers, and merged-cell continuation cue.
+                    let base_col = if on { sel_fg } else { fg };
+                    let merged_col = base_col.gamma_multiply(0.65);
+                    let mut x = rect.min.x + chk_w + num_w;
+                    let mut hovered_col_idx: Option<usize> = None;
+                    for (c, v) in t.rows[ri].iter().enumerate() {
+                        let cell = Rect::from_min_size(pos2(x, rect.min.y), vec2(widths[c], row_h));
+                        if cfg.table_grid_lines {
+                            p.line_segment([pos2(x, rect.min.y), pos2(x, rect.max.y)], (1.0, grid_col));
+                        }
+                        let inherited = cfg.table_show_merged_tint && t.is_merged(ri, c);
+                        if inherited {
+                            p.line_segment(
+                                [pos2(x + 3.0, rect.min.y + 3.0), pos2(x + 3.0, rect.max.y - 3.0)],
+                                (2.0, merged_bar_col),
+                            );
+                        }
+                        let text = cell_one_line(v);
+                        let col = if inherited { merged_col } else { base_col };
+                        let pad = cfg.table_cell_pad + if inherited { 3.0 } else { 0.0 };
+                        let galley = p.layout_no_wrap(text.clone(), font.clone(), col);
+                        let clipped = galley.size().x > (widths[c] - pad - 6.0);
+                        p.with_clip_rect(cell.shrink2(vec2(4.0, 0.0)))
+                            .galley(pos2(x + pad, rect.center().y - galley.size().y / 2.0), galley, col);
+                        if resp.hovered() && pointer_pos.is_some_and(|pt| cell.contains(pt)) {
+                            hovered_col_idx = Some(c);
+                            if (clipped || v.contains('\n')) && !v.trim().is_empty() {
+                                hover_tip = Some(v.clone());
+                            }
+                        }
+                        x += widths[c];
                     }
+
+                    // Pointer press starts click/shift-range OR drag-painting!
+                    if primary_pressed && pointer_pos.is_some_and(|pt| rect.contains(pt)) {
+                        if shift {
+                            click_row(sel, &visible, last, vi, true);
+                        } else {
+                            let target_state = !on;
+                            if target_state {
+                                if !sel.contains(&ri) {
+                                    sel.push(ri);
+                                }
+                            } else {
+                                sel.retain(|&r| r != ri);
+                            }
+                            *drag = Some(target_state);
+                            *last = Some(ri);
+                        }
+                        *preview_row = Some(ri);
+                    } else if primary_down && let Some(target_state) = *drag {
+                        if pointer_pos.is_some_and(|pt| rect.contains(pt)) && *last != Some(ri) {
+                            // Paint the entire visible span from `last` to `vi` so fast drags never skip rows.
+                            let a = last.and_then(|r| visible.iter().position(|&x| x == r)).unwrap_or(vi);
+                            for &r in &visible[a.min(vi)..=a.max(vi)] {
+                                if target_state {
+                                    if !sel.contains(&r) {
+                                        sel.push(r);
+                                    }
+                                } else {
+                                    sel.retain(|&x| x != r);
+                                }
+                            }
+                            *last = Some(ri);
+                            *preview_row = Some(ri);
+                        }
+                    }
+
+                    // Remember which column was right-clicked for the context menu.
+                    let col_id = ui.scope_id().with(("ctx_col", ri));
+                    if resp.secondary_clicked() {
+                        if let Some(c) = hovered_col_idx {
+                            ui.data_mut(|d| d.insert_temp(col_id, c));
+                        }
+                    }
+                    let ctx_col: Option<usize> = ui.data(|d| d.get_temp(col_id));
+                    resp.context_menu(|ui| {
+                        if let Some(c) = ctx_col.filter(|&c| c < t.headers.len()) {
+                            let val = &t.rows[ri][c];
+                            if !val.trim().is_empty() {
+                                let hdr = &t.headers[c];
+                                let short = cell_one_line(val);
+                                let short_cut = if short.chars().count() > 26 {
+                                    format!("{}…", short.chars().take(26).collect::<String>())
+                                } else {
+                                    short
+                                };
+                                let count = visible.iter().filter(|&&r| t.rows[r][c] == *val).count();
+                                if ui.button(format!("Select all “{hdr} = {short_cut}” ({count})")).clicked() {
+                                    group_op = Some((c, val.clone(), GroupOp::Add));
+                                    ui.close();
+                                }
+                                if ui.button(format!("Only select “{hdr} = {short_cut}” ({count})")).clicked() {
+                                    group_op = Some((c, val.clone(), GroupOp::Only));
+                                    ui.close();
+                                }
+                                if ui.button(format!("Deselect “{hdr} = {short_cut}”")).clicked() {
+                                    group_op = Some((c, val.clone(), GroupOp::Remove));
+                                    ui.close();
+                                }
+                                ui.separator();
+                            }
+                        }
+                        if ui.button(format!("Preview this {unit}")).clicked() {
+                            *preview_row = Some(ri);
+                            ui.close();
+                        }
+                        if !by_columns {
+                            if let Ok(sheet_row) = t.row_labels[ri].parse::<usize>() {
+                                if ui.button(format!("Use Row {sheet_row} as header row")).clicked() {
+                                    *act = TableAction::UseHeaderRow(sheet_row);
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
                 }
             });
+        if let Some(tip) = hover_tip {
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
+                ui.layer_id(),
+                egui::Id::unique("cell_tip"),
+                egui::PopupAnchor::Pointer,
+            )
+            .show(|ui| {
+                ui.set_max_width(360.0);
+                ui.label(tip);
+            });
+        }
     });
+
+    if let Some((col, val, op)) = group_op {
+        let matching: Vec<usize> = visible.iter().copied().filter(|&r| t.rows[r][col] == val).collect();
+        match op {
+            GroupOp::Add => {
+                for r in &matching {
+                    if !sel.contains(r) {
+                        sel.push(*r);
+                    }
+                }
+            }
+            GroupOp::Only => {
+                *sel = matching.clone();
+            }
+            GroupOp::Remove => {
+                let drop_set: std::collections::HashSet<usize> = matching.iter().copied().collect();
+                sel.retain(|r| !drop_set.contains(r));
+            }
+        }
+        if let Some(&first) = matching.first() {
+            *preview_row = Some(first);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    ui.label(
+        RichText::new(format!(
+            "Tip: drag across {units} to paint selection · ⇧-click for range · right-click any cell to select a group"
+        ))
+        .small()
+        .weak(),
+    );
+    #[cfg(not(target_os = "macos"))]
+    ui.label(
+        RichText::new(format!(
+            "Tip: drag across {units} to paint selection · Shift-click for range · right-click any cell to select a group"
+        ))
+        .small()
+        .weak(),
+    );
+}
+
+#[derive(Clone, Copy)]
+enum GroupOp {
+    Add,
+    Only,
+    Remove,
 }
 
 /// Row click: toggle, or ⇧ adds the range from the last clicked row. `last` is a sheet row,
@@ -2391,7 +3351,11 @@ fn image_editor(ui: &mut egui::Ui, im: &mut ImageBlock) -> bool {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.dev.poll(&ctx);
+        self.dev.apply(&ctx);
         self.pump();
+        self.pump_dialogs();
+        self.handle_dropped_files(&ctx);
         self.updates(&ctx);
         self.check_update(&ctx);
         if self.handle.is_none() && self.p.auto_connect && self.p.printer.is_none() {
@@ -2414,25 +3378,40 @@ impl eframe::App for App {
             self.top_bar(ui);
             ui.add_space(2.0);
         });
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::right("print").resizable(false).exact_size(300.0).show(ui, |ui| {
+        egui::Panel::right("print").resizable(false).exact_size(self.dev.cfg.right_panel_width).show(ui, |ui| {
+            egui::Panel::bottom("print_footer")
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 4 }))
+                .show_separator_line(false)
+                .show(ui, |ui| self.status_right(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.print_panel(ui));
         });
+        let status_frame = egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 4));
+        egui::Panel::bottom("status").frame(status_frame).show(ui, |ui| self.status_left(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             self.preview_ui(ui);
             ui.add_space(6.0);
             self.label_options(ui);
-            ui.add_space(4.0);
-            self.add_block_bar(ui);
+            ui.separator();
+            self.add_block_bar(&ctx, ui);
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.data_panel(ui);
-                self.blocks_ui(ui);
+                self.data_panel(&ctx, ui);
+                self.blocks_ui(&ctx, ui);
             });
         });
+        if self.dev.cfg.preview_update_modal {
+            #[cfg(feature = "dev")]
+            {
+                if self.update.is_none() {
+                    self.update = Some(crate::update::Release::dev_preview());
+                }
+                self.update_modal = true;
+            }
+        }
         if self.update_modal {
             self.update_dialog(&ctx);
         }
+        self.dev.window(&ctx);
         self.update_title(&ctx);
     }
 

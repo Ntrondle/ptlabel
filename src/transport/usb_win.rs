@@ -3,11 +3,13 @@
 //!
 //! Works out of the box without Zadig/WinUSB: enumerates connected `VID_04F9` P-touch
 //! interfaces via SetupAPI and talks the same bidirectional 32-byte-status + raster
-//! protocol over overlapped `ReadFile`/`WriteFile`.
+//! protocol over overlapped `ReadFile`/`WriteFile`. `PTLABEL_USB_TRACE=1` logs the transfers.
 
 use super::{Link, PrinterId};
 use anyhow::{Context, Result, bail};
 use std::io::{self, ErrorKind, Read, Write};
+use std::mem::ManuallyDrop;
+use std::sync::OnceLock;
 use std::time::Duration;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
@@ -15,9 +17,8 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetDeviceInterfaceDetailW,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
@@ -218,11 +219,100 @@ pub fn scan_usb() -> Vec<PrinterId> {
     out
 }
 
+/// Bulk-IN read size: a whole high-speed packet, so a 32-byte status always fits.
+const READ_LEN: usize = 512;
+/// Largest single `WriteFile` (BtTransport writes 1 KiB chunks).
+const WRITE_LEN: usize = 4096;
+
+/// `PTLABEL_USB_TRACE=1`: log USB transfers to stderr (e.g. `ptlabel status usb` in a terminal).
+fn trace(msg: impl FnOnce() -> String) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("PTLABEL_USB_TRACE").is_some()) {
+        eprintln!("usb: {}", msg());
+    }
+}
+
+/// One overlapped transfer. The OVERLAPPED and buffer live on the heap and are only freed once
+/// the driver is done with them: a transfer that never completes is leaked, never freed under it.
+struct Xfer {
+    ov: ManuallyDrop<Box<OVERLAPPED>>,
+    buf: ManuallyDrop<Vec<u8>>,
+    pending: bool,
+}
+
+impl Xfer {
+    fn new(len: usize) -> io::Result<Self> {
+        let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if ev.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut ov: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+        ov.hEvent = ev;
+        Ok(Self { ov: ManuallyDrop::new(ov), buf: ManuallyDrop::new(vec![0; len]), pending: false })
+    }
+
+    /// Mark the transfer started by `ReadFile`/`WriteFile` (`ok` = its return value) as in flight.
+    /// Completed or queued, the event reports the result either way.
+    fn started(&mut self, ok: i32) -> io::Result<()> {
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+        }
+        self.pending = true;
+        Ok(())
+    }
+
+    /// Wait up to `ms` for the transfer: `None` while it is still running, else its result.
+    fn wait(&mut self, handle: HANDLE, ms: u32) -> Option<io::Result<usize>> {
+        match unsafe { WaitForSingleObject(self.ov.hEvent, ms) } {
+            WAIT_TIMEOUT => None,
+            WAIT_OBJECT_0 => {
+                self.pending = false;
+                let mut n: u32 = 0;
+                Some(if unsafe { GetOverlappedResult(handle, &**self.ov, &mut n, 0) } != 0 {
+                    Ok(n as usize)
+                } else {
+                    Err(io::Error::last_os_error())
+                })
+            }
+            _ => Some(Err(io::Error::last_os_error())),
+        }
+    }
+
+    /// Cancel and give the driver `ms` to let go; `false` if the transfer is still pending.
+    fn cancel(&mut self, handle: HANDLE, ms: u32) -> bool {
+        if self.pending {
+            unsafe { CancelIoEx(handle, &**self.ov) };
+            let _ = self.wait(handle, ms);
+        }
+        !self.pending
+    }
+}
+
+impl Drop for Xfer {
+    fn drop(&mut self) {
+        if self.pending {
+            // The driver may still fill the buffer and signal the event: leak both.
+            trace(|| "transfer still pending at close, leaking its buffer".into());
+            return;
+        }
+        unsafe {
+            CloseHandle(self.ov.hEvent);
+            ManuallyDrop::drop(&mut self.ov);
+            ManuallyDrop::drop(&mut self.buf);
+        }
+    }
+}
+
 /// Overlapped Win32 handle to a `usbprint.sys` device interface.
 pub struct UsbPrint {
     handle: HANDLE,
-    read_ev: HANDLE,
-    write_ev: HANDLE,
+    rd: Xfer,
+    wr: Xfer,
+    /// Bytes read but not handed out yet.
+    rx: Vec<u8>,
 }
 
 // SAFETY: Win32 file and event handles are safe to transfer across threads.
@@ -254,6 +344,7 @@ impl UsbPrint {
             target.to_string()
         };
 
+        trace(|| format!("open {resolved}"));
         let wide = to_wide(&resolved);
         let handle = unsafe {
             CreateFileW(
@@ -268,110 +359,79 @@ impl UsbPrint {
         };
         if handle == INVALID_HANDLE_VALUE {
             let err = io::Error::last_os_error();
+            trace(|| format!("open failed: {err}"));
             return Err(err).context("can't open USB printer (is it powered on with Editor Lite off?)");
         }
 
-        let read_ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        if read_ev.is_null() {
-            let err = io::Error::last_os_error();
-            unsafe { CloseHandle(handle) };
-            return Err(err).context("CreateEventW failed");
-        }
-        let write_ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        if write_ev.is_null() {
-            let err = io::Error::last_os_error();
-            unsafe {
-                CloseHandle(read_ev);
-                CloseHandle(handle);
+        let xfers = Xfer::new(READ_LEN).and_then(|rd| Ok((rd, Xfer::new(WRITE_LEN)?)));
+        let (rd, wr) = match xfers {
+            Ok(x) => x,
+            Err(e) => {
+                unsafe { CloseHandle(handle) };
+                return Err(e).context("CreateEventW failed");
             }
-            return Err(err).context("CreateEventW failed");
-        }
-
-        Ok(Self { handle, read_ev, write_ev })
-    }
-}
-
-fn wait_overlapped(handle: HANDLE, ov: &mut OVERLAPPED, timeout_ms: u32) -> io::Result<usize> {
-    let mut transferred: u32 = 0;
-    match unsafe { WaitForSingleObject(ov.hEvent, timeout_ms) } {
-        WAIT_OBJECT_0 => {
-            if unsafe { GetOverlappedResult(handle, ov, &mut transferred, 0) } != 0 {
-                Ok(transferred as usize)
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        }
-        WAIT_TIMEOUT => {
-            unsafe { CancelIoEx(handle, ov) };
-            // Must wait for the canceled IRP to finish before `ov` leaves the stack.
-            if unsafe { GetOverlappedResult(handle, ov, &mut transferred, 1) } != 0 {
-                Ok(transferred as usize)
-            } else {
-                let err = unsafe { GetLastError() };
-                if err == ERROR_OPERATION_ABORTED {
-                    Err(ErrorKind::TimedOut.into())
-                } else {
-                    Err(io::Error::from_raw_os_error(err as i32))
-                }
-            }
-        }
-        _ => {
-            let err = io::Error::last_os_error();
-            unsafe {
-                CancelIoEx(handle, ov);
-                let _ = GetOverlappedResult(handle, ov, &mut transferred, 1);
-            }
-            Err(err)
-        }
+        };
+        Ok(Self { handle, rd, wr, rx: Vec::new() })
     }
 }
 
 impl Read for UsbPrint {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = buf.len().min(u32::MAX as usize) as u32;
-        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-        ov.hEvent = self.read_ev;
-        let mut n: u32 = 0;
-        let ok = unsafe { ReadFile(self.handle, buf.as_mut_ptr(), len, &mut n, &mut ov) };
-        let res = if ok != 0 {
-            Ok(n as usize)
-        } else {
-            let err = unsafe { GetLastError() };
-            if err == ERROR_IO_PENDING {
-                wait_overlapped(self.handle, &mut ov, 100)
-            } else {
-                Err(io::Error::from_raw_os_error(err as i32))
+    /// Waits up to ~100 ms for data. A read still pending then stays queued and is collected by
+    /// the next call instead of being cancelled: usbprint.sys may not finish a cancelled Bulk-IN
+    /// read before data arrives, and waiting for that blocked the printer worker for good
+    /// (the UI stuck at "Connecting…"). Keeping it queued also can't drop a reply mid-cancel.
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.rx.is_empty() {
+            if !self.rd.pending {
+                let x = &mut self.rd;
+                let ok = unsafe {
+                    ReadFile(self.handle, x.buf.as_mut_ptr(), x.buf.len() as u32, std::ptr::null_mut(), &mut **x.ov)
+                };
+                x.started(ok).inspect_err(|e| trace(|| format!("ReadFile failed: {e}")))?;
             }
-        };
-        // usbprint.sys can complete a Bulk-IN read with 0 bytes (ZLP) when idle; treat as timeout
-        // rather than EOF so BtTransport keeps waiting instead of dropping the handle.
-        match res {
-            Ok(0) => {
+            let n = match self.rd.wait(self.handle, 100) {
+                None => return Err(ErrorKind::TimedOut.into()),
+                Some(r) => r.inspect_err(|e| trace(|| format!("read failed: {e}")))?,
+            };
+            // usbprint.sys can complete a Bulk-IN read with 0 bytes (ZLP) when idle; treat as a
+            // timeout rather than EOF so BtTransport keeps waiting instead of dropping the handle.
+            if n == 0 {
                 std::thread::sleep(Duration::from_millis(5));
-                Err(ErrorKind::TimedOut.into())
+                return Err(ErrorKind::TimedOut.into());
             }
-            other => other,
+            let data = &self.rd.buf[..n];
+            trace(|| format!("read {n}: {data:02X?}"));
+            self.rx.extend_from_slice(data);
         }
+        let n = self.rx.len().min(out.len());
+        out[..n].copy_from_slice(&self.rx[..n]);
+        self.rx.drain(..n);
+        Ok(n)
     }
 }
 
 impl Write for UsbPrint {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let len = buf.len().min(u32::MAX as usize) as u32;
-        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-        ov.hEvent = self.write_ev;
-        let mut n: u32 = 0;
-        let ok = unsafe { WriteFile(self.handle, buf.as_ptr(), len, &mut n, &mut ov) };
-        if ok != 0 {
-            Ok(n as usize)
-        } else {
-            let err = unsafe { GetLastError() };
-            if err == ERROR_IO_PENDING {
-                wait_overlapped(self.handle, &mut ov, 20_000)
-            } else {
-                Err(io::Error::from_raw_os_error(err as i32))
-            }
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.wr.pending {
+            return Err(io::Error::other("an earlier USB write never completed"));
         }
+        let len = data.len().min(WRITE_LEN);
+        self.wr.buf[..len].copy_from_slice(&data[..len]);
+        let x = &mut self.wr;
+        let ok = unsafe { WriteFile(self.handle, x.buf.as_ptr(), len as u32, std::ptr::null_mut(), &mut **x.ov) };
+        x.started(ok).inspect_err(|e| trace(|| format!("WriteFile failed: {e}")))?;
+        if let Some(r) = x.wait(self.handle, 20_000) {
+            trace(|| format!("write {len}: {r:?}"));
+            return r;
+        }
+        // Printer not taking data: cancel, keeping whatever part of it already went out.
+        if !x.cancel(self.handle, 1_000) {
+            trace(|| "write timed out and won't cancel".into());
+            return Err(io::Error::other("USB write neither completed nor cancelled"));
+        }
+        let sent = x.ov.InternalHigh;
+        trace(|| format!("write {len}: timed out after {sent} bytes"));
+        if sent == 0 { Err(ErrorKind::TimedOut.into()) } else { Ok(sent) }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -381,11 +441,10 @@ impl Write for UsbPrint {
 
 impl Drop for UsbPrint {
     fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.write_ev);
-            CloseHandle(self.read_ev);
-            CloseHandle(self.handle);
-        }
+        // Transfers that won't let go keep their buffers (leaked in Xfer::drop).
+        self.rd.cancel(self.handle, 500);
+        self.wr.cancel(self.handle, 500);
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
