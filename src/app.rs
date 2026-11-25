@@ -2335,7 +2335,7 @@ impl App {
             .x;
         let sz = if ref_w > 0.0 { (ref_sz * (avail_w * 0.88) / ref_w).clamp(11.0, 14.0) } else { 13.0 };
 
-        ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
             if let Some(r) = &self.update {
                 let t = if self.updating { "Updating…".to_string() } else { format!("Update to {}…", r.version) };
